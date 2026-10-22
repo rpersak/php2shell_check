@@ -4,9 +4,10 @@
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
 (CVE-2026-109618 / CVE-2026-109619).
 
-Version 2.3.0 (2026-10-22)
+Version 2.3.1 (2026-10-22)
 
 Changelog
+  2.3.1  2026-10-22  Header changelog: corrected the release date of 1.0.0.
   2.3.0  2026-10-22  Ideas from php2shell-triage.sh (Laravel/Forge) plus gaps found while comparing: framework
                      aware scan (PHP where Laravel/Symfony/Drupal/WordPress never keep PHP, any date), git
                      status against the committed code, deployment noise summarised, log paths taken from
@@ -25,7 +26,7 @@ Changelog
                      echo, per-step result, checklist); --quiet; scope and environment detection
                      (OS, package manager, container, panels); Alpine (apk) and cPanel EA-PHP support;
                      --version flag; script version in output and JSON.
-  1.0.0  2026-10-21  First all-in-one checker (versions, config, processes, files, persistence, logs).
+  1.0.0  2026-10-22  First all-in-one checker (versions, config, processes, files, persistence, logs).
 
 Read-only: it never changes files, never sends traffic, never exploits anything.
 Python 3.6+, standard library only. Linux. Run as root for full visibility:
@@ -96,7 +97,7 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 VERSION_DATE = "2026-10-22"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 

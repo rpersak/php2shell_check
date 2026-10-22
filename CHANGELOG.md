@@ -2,6 +2,11 @@
 
 All notable changes to `php2shell_check.py`. The format follows [Keep a Changelog](https://keepachangelog.com/); versions follow semantic versioning, where the command-line options and the report format are the public interface.
 
+## [2.3.1] - 2026-10-22
+
+### Fixed
+- Header changelog inside the script: corrected the release date of 1.0.0.
+
 ## [2.3.0] - 2026-10-22
 
 ### Added
