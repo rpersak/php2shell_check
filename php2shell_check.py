@@ -4,9 +4,12 @@
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
 (CVE-2026-109618 / CVE-2026-109619).
 
-Version 2.0.0 (2026-10-22)
+Version 2.1.0 (2026-10-22)
 
 Changelog
+  2.1.0  2026-10-22  Step 5 also reads shell history files (bash/zsh) of all accounts: reverse shells,
+                     download-and-run, decode-and-run, temp-dir execution, history tampering, PoC markers;
+                     a history file on a web account is flagged by itself; secrets are masked on screen.
   2.0.0  2026-10-22  Live English narration of every step (plan, WHAT/WHY/FLAGGED banners, sub-action
                      echo, per-step result, checklist); --quiet; scope and environment detection
                      (OS, package manager, container, panels); Alpine (apk) and cPanel EA-PHP support;
@@ -81,7 +84,7 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 VERSION_DATE = "2026-10-22"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 
@@ -1005,6 +1008,127 @@ def check_files(rep, args, since_ts, web_users):
 # --------------------------------------------------------------------------
 # 5. persistence
 # --------------------------------------------------------------------------
+HIST_FILES = (".bash_history", ".zsh_history", ".sh_history", ".ash_history", ".history")
+HIST_PATTERNS = [
+    ("download and run (curl/wget piped to a shell)",
+     re.compile(r"\b(curl|wget|fetch)\b[^|;]*\|\s*(sudo\s+)?(ba|z|da)?sh\b")),
+    ("reverse shell / raw socket",
+     re.compile(r"/dev/(tcp|udp)/|\b(nc|ncat|netcat)\b[^|;]*\s-[a-z]*e\b|bash\s+-i\s*>&|\bsocat\b.*exec", re.I)),
+    ("decode and run (base64 piped to a shell)",
+     re.compile(r"base64\s+(-d|--decode)[^|;]*\|\s*(ba|z|da)?sh\b|\|\s*base64\s+(-d|--decode)\s*\|")),
+    ("execution from a temp directory",
+     re.compile(r"(chmod\s+(\+x|[0-7]*7[0-7]*)\s+|\./|\bsh\s+|\bbash\s+|python3?\s+|perl\s+|\bphp\s+)\S*"
+                r"(/tmp/|/var/tmp/|/dev/shm/)|(^|[;&|]\s*)(/tmp/|/var/tmp/|/dev/shm/)\S+")),
+    ("history tampering",
+     re.compile(r"unset\s+HISTFILE|HISTFILE=/dev/null|HISTSIZE=0|history\s+-[cw]\b|ln\s+-s\w*\s+/dev/null\s+\S*history|"
+                r"shred\b.*history|>\s*~?/?\S*\.\w*history", re.I)),
+    ("PHP2Shell PoC marker", re.compile(r"php2shell|jackalpoc", re.I)),
+    ("PHP one-liner executing code",
+     re.compile(r"\bphp\s+-r\s+.*(system|exec|passthru|shell_exec|base64_decode|eval)\s*\(", re.I)),
+]
+HIST_TS_RE = re.compile(r"^#(\d{9,11})$")
+ZSH_RE = re.compile(r"^: (\d{9,11}):\d+;(.*)$")
+SECRET_RE = re.compile(r"(?i)(pass(?:word)?|pwd|token|secret|api_?key)(=|\s+)\S+")
+
+
+def redact(cmd):
+    cmd = SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", cmd)
+    return re.sub(r"(\s-p)\S+", r"\1<redacted>", cmd)
+
+
+def check_shell_history(rep, sec, web_users, since_ts):
+    say("Looking at shell history files (.bash_history, .zsh_history, ...) of every account with a home directory. "
+        "Commands run through a webshell or system() are NOT written to history; an entry only exists if someone "
+        "had an interactive shell. Matching is pattern-only and secrets are masked on screen.")
+    homes = {}
+    for line in read_text("/etc/passwd").splitlines():
+        p = line.split(":")
+        if len(p) >= 7 and p[5] and os.path.isdir(p[5]):
+            homes[p[0]] = p[5]
+    if "root" not in homes and os.path.isdir("/root"):
+        homes["root"] = "/root"
+    web_set = set(web_users) | {"www-data", "apache", "nginx", "wwwrun", "httpd", "www"}
+    found = defaultdict(list)
+    files_seen = unreadable = lines_read = 0
+    no_ts = False
+    for user, home in sorted(homes.items()):
+        isweb = user in web_set
+        for hf in HIST_FILES:
+            path = os.path.join(home, hf)
+            if not os.path.lexists(path):
+                continue
+            files_seen += 1
+            if os.path.islink(path) and os.path.realpath(path) == "/dev/null":
+                say("%s is a link to /dev/null (history switched off)" % path, 2)
+                found["MEDIUM" if isweb else "LOW"].append("%s -> /dev/null (history disabled%s)" %
+                                                         (path, " for a web account" if isweb else ""))
+                continue
+            try:
+                st = os.stat(path)
+            except Exception:
+                unreadable += 1
+                continue
+            if st.st_size == 0:
+                continue
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+            if isweb:
+                say("web account '%s' HAS a history file %s (%d bytes, modified %s)" % (user, path, st.st_size, stamp), 2)
+                found["MEDIUM"].append("%s: web account has a shell history file (%d bytes, modified %s). Such accounts "
+                                       "normally have none; this means an interactive shell was used" %
+                                       (path, st.st_size, stamp))
+            if st.st_mtime < since_ts:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    if st.st_size > 2000000:
+                        f.seek(-2000000, 2)
+                    raw = f.read().decode("utf-8", "replace")
+            except Exception:
+                unreadable += 1
+                continue
+            say("scanning %s (user %s)" % (path, user), 2)
+            ts = None
+            stamped = False
+            for line in raw.splitlines():
+                lines_read += 1
+                m = HIST_TS_RE.match(line)
+                if m:
+                    ts = int(m.group(1))
+                    stamped = True
+                    continue
+                z = ZSH_RE.match(line)
+                if z:
+                    ts, line, stamped = int(z.group(1)), z.group(2), True
+                if ts is not None and ts < since_ts:
+                    continue
+                for label, rx in HIST_PATTERNS:
+                    if rx.search(line):
+                        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "no timestamp"
+                        if not ts:
+                            no_ts = True
+                        sev = "HIGH" if isweb else "MEDIUM"
+                        if label == "history tampering" and not isweb:
+                            sev = "MEDIUM"
+                        found[sev].append("%s [%s] %s: %s" % (path, when, label, trunc(redact(line.strip()), 170)))
+                        break
+    say("result: %d history file(s) looked at, %d line(s) read%s" %
+        (files_seen, lines_read, ", %d unreadable (run as root)" % unreadable if unreadable else ""), 2)
+    titles = {"HIGH": "Suspicious commands in the shell history of a WEB account",
+              "MEDIUM": "Shell history findings (web account with history, tampering, or risky commands; admins "
+                        "may have run some of these legitimately)",
+              "LOW": "Shell history switched off via /dev/null"}
+    for sev in ("HIGH", "MEDIUM", "LOW"):
+        if found[sev]:
+            det = list(found[sev])
+            if no_ts and sev != "LOW":
+                det.append("note: entries without a timestamp cannot be dated (HISTTIMEFORMAT not set); only the "
+                           "file modification time was used")
+            rep.add(sev, sec, "%s: %d" % (titles[sev], len(found[sev])), det)
+    if not any(found.values()):
+        rep.add("INFO", sec, "Shell history: %d file(s) checked, nothing suspicious. Webshell commands never "
+                "appear in history, so this is weak evidence" % files_seen)
+
+
 def check_persistence(rep, since_ts, web_users, pool_users):
     sec = "5. Persistence and system changes"
     users = set(web_users) | set(pool_users) | {"www-data", "apache", "nginx", "wwwrun", "www", "httpd"}
@@ -1050,6 +1174,8 @@ def check_persistence(rep, since_ts, web_users, pool_users):
     say("%s" % ("FOUND: " + "; ".join(uid0) if uid0 else "only 'root' has UID 0 - OK"), 2)
     if uid0:
         rep.add("HIGH", sec, "Additional account(s) with UID 0", uid0)
+
+    check_shell_history(rep, sec, users, since_ts)
 
     say("Checking whether sensitive system files changed since the cutoff (passwd, shadow, sudoers, cron, "
         "systemd units, rc.local, profile.d, init.d, sshd_config, root authorized_keys) ...")
@@ -1371,7 +1497,9 @@ STEP_TEXT = {
         "web user in /tmp (HIGH)."),
     5: ("Persistence and system changes",
         "Checks crontabs, SSH keys and login shells of web accounts, /etc/ld.so.preload, extra UID 0 accounts, "
-        "and whether passwd, shadow, sudoers, cron, systemd units and similar files changed since the cutoff.",
+        "shell history files (bash/zsh) of all accounts for reverse shells, download-and-run, history tampering "
+        "and PoC markers, and whether passwd, shadow, sudoers, cron, systemd units and similar files changed "
+        "since the cutoff.",
         "After code execution attackers typically add a way back in. Web accounts normally have none of these.",
         "ld.so.preload content or a second UID 0 account (HIGH); web user with crontab/authorized_keys or a "
         "changed system file (MEDIUM - package updates also change files, so verify)."),

@@ -2,6 +2,14 @@
 
 All notable changes to `php2shell_check.py`. The format follows [Keep a Changelog](https://keepachangelog.com/); versions follow semantic versioning, where the command-line options and the report format are the public interface.
 
+## [2.1.0] - 2026-10-22
+
+### Added
+- Shell history check (step 5) for `.bash_history`, `.zsh_history` and similar: reverse shells, download-and-run, decode-and-run, execution from temp directories, history tampering, PoC markers, `php -r` one-liners. A history file on a web account is flagged on its own. Secrets are masked in the output.
+
+### Fixed
+- The temp-directory execution pattern missed `chmod +x /tmp/a; /tmp/a`.
+
 ## [2.0.0] - 2026-10-22
 
 ### Added
