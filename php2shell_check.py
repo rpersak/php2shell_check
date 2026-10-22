@@ -4,30 +4,47 @@
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
 (CVE-2026-109618 / CVE-2026-109619).
 
+Version 2.0.0 (2026-10-22)
+
+Changelog
+  2.0.0  2026-10-22  Live English narration of every step (plan, WHAT/WHY/FLAGGED banners, sub-action
+                     echo, per-step result, checklist); --quiet; scope and environment detection
+                     (OS, package manager, container, panels); Alpine (apk) and cPanel EA-PHP support;
+                     --version flag; script version in output and JSON.
+  1.0.0  2026-10-21  First all-in-one checker (versions, config, processes, files, persistence, logs).
+
 Read-only: it never changes files, never sends traffic, never exploits anything.
 Python 3.6+, standard library only. Linux. Run as root for full visibility:
 
     sudo python3 php2shell_check.py
     sudo python3 php2shell_check.py --since 2026-10-17 --json report.json
     sudo python3 php2shell_check.py --webroot /srv/app --access-log '/data/logs/*.log*'
+    sudo python3 php2shell_check.py --quiet          # only the final report, no step narration
 
-What it checks
-  1. PHP versions (CLI/FPM/CGI binaries, mod_php modules) against the fixed
-     releases 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35, including distro backports
-     (package changelog mentions the CVE ids).
-  2. Configuration relevant to the PHP advisory mitigations
-     (session.upload_progress.enabled, memory_limit, post_max_size,
-     fatal_error_backtraces, pm.max_requests, per-pool overrides).
-  3. Running processes: workers still running a replaced (deleted) binary after
-     an update, shells / recon tools spawned by web or PHP processes,
-     outbound connections from web processes.
-  4. Files: recently changed code in web roots, webshell patterns, PHP inside
-     upload/cache dirs, PHP hidden in images, auto_prepend_file tricks,
-     suspicious files in /tmp, /var/tmp, /dev/shm.
-  5. Persistence: cron of web users, ld.so.preload, extra UID 0 accounts,
-     recently modified system files, authorized_keys of web users.
-  6. Logs: access logs (nginx/Apache, also .gz) and error/syslog files from
-     --since onward.
+The script narrates everything it does: a plan at the start, a banner for every
+step (what it does, why, what gets flagged), live "> ..." lines for every
+sub-action, a result line per step, then the full findings and a checklist.
+
+Suitable systems (the script also prints this, plus what it detected, at start)
+  SUPPORTED : Linux (Debian/Ubuntu, RHEL/Alma/Rocky/CentOS/Fedora/Amazon Linux, SUSE) on bare metal,
+              VM or LXC; also INSIDE a Docker/Podman container (run it in the container).
+              Web stack: nginx, Apache (mod_php), LiteSpeed, Caddy, lighttpd, FrankenPHP with
+              PHP-FPM / CGI / mod_php. Plesk, cPanel, Hestia, DirectAdmin: works, paths partly covered.
+  LIMITED   : Alpine (apk: version check only, no changelog/backport check), Docker/K8s HOST (cannot
+              see inside images: run it in each container or check image tags), non-standard log
+              or webroot paths (use --webroot / --access-log / --error-log).
+  NOT FOR   : Windows (IIS, XAMPP, WAMP), macOS, *BSD, shared hosting without shell access, managed
+              PaaS (use the provider's advisory instead).
+
+Steps
+  1. PHP versions and patch status (fixed: 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35,
+     distro backports detected through package changelogs)
+  2. PHP configuration (interim mitigations from the PHP advisory)
+  3. Running processes and network connections
+  4. Web root files, webshells and temp directories
+  5. Persistence and system changes
+  6. Access logs
+  7. Error logs and syslog
 
 IMPORTANT LIMITS
   * There are no official IOCs. Log and file heuristics come from public
@@ -54,6 +71,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import textwrap
 import time
 from collections import Counter, defaultdict
 
@@ -63,6 +81,8 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
+__version__ = "2.0.0"
+VERSION_DATE = "2026-10-22"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 
 SEV_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -118,10 +138,44 @@ UP_RE = re.compile(r"PHP_SESSION_UPLOAD_PROGRESS|upload_progress", re.I)
 WEBSHELL_URL_RE = re.compile(r"(?i)/(uploads?|files|cache|tmp|temp|media|images|img)/[^?\s]*\.(php\d?|phtml|phar|pht)(\?|$)")
 
 # --------------------------------------------------------------------------
+# narration helpers (everything the script does is echoed, unless --quiet)
+# --------------------------------------------------------------------------
+QUIET = False
+WIDTH = 100
+
+
+def say(msg, level=1):
+    """Echo one sub-action line, e.g. '  > Reading /proc ...'."""
+    if QUIET:
+        return
+    prefix = "  " * level + "> "
+    print(textwrap.fill(msg, width=WIDTH, initial_indent=prefix,
+                        subsequent_indent=" " * len(prefix), break_long_words=False,
+                        break_on_hyphens=False))
+    sys.stdout.flush()
+
+
+def labelled(label, text):
+    lab = "  %-14s: " % label
+    return textwrap.fill(text, width=WIDTH, initial_indent=lab, subsequent_indent=" " * len(lab),
+                         break_long_words=False, break_on_hyphens=False)
+
+
+def banner(num, total, title, what, why, flagged):
+    if QUIET:
+        return
+    print("\n" + "=" * 78)
+    print("[STEP %d/%d] %s" % (num, total, title))
+    print(labelled("WHAT IT DOES", what))
+    print(labelled("WHY", why))
+    print(labelled("FLAGGED WHEN", flagged))
+    print("-" * 78)
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-
-
 class Report(object):
     def __init__(self, color):
         self.items = []
@@ -141,14 +195,15 @@ class Report(object):
         c = Counter(i["severity"] for i in self.items)
         return {k: c.get(k, 0) for k in SEV_RANK}
 
+    def tag(self, sev):
+        t = "[%s]" % sev
+        return COLORS[sev] + t + RESET if self.color else t
+
     def print(self, sample):
         for sec in self.sections:
             print("\n== %s ==" % sec)
             for it in [i for i in self.items if i["section"] == sec]:
-                tag = "[%s]" % it["severity"]
-                if self.color:
-                    tag = COLORS[it["severity"]] + tag + RESET
-                print("%s %s" % (tag, it["title"]))
+                print("%s %s" % (self.tag(it["severity"]), it["title"]))
                 d = it["details"]
                 for line in d[:sample]:
                     print("      " + line)
@@ -211,11 +266,78 @@ def safe(rep, name, fn, *a, **kw):
         return fn(*a, **kw)
     except Exception as e:  # noqa
         rep.add("LOW", name, "Check crashed and was skipped: %s: %s" % (type(e).__name__, e))
+        say("this step hit an unexpected error and was skipped: %s: %s" % (type(e).__name__, e))
         return None
 
 
 def is_web(comm):
     return any(comm.startswith(p) for p in WEB_PREFIXES)
+
+
+# --------------------------------------------------------------------------
+# 0. environment and scope
+# --------------------------------------------------------------------------
+SCOPE_TEXT = [
+    ("SUPPORTED", "Linux (Debian/Ubuntu, RHEL/Alma/Rocky/CentOS/Fedora/Amazon Linux, SUSE) on bare metal, VM or "
+                  "LXC, and INSIDE a Docker/Podman container (run the script in the container). Web stacks: nginx, "
+                  "Apache (mod_php), LiteSpeed, Caddy, lighttpd, FrankenPHP with PHP-FPM / CGI / mod_php. "
+                  "Plesk, cPanel, Hestia and DirectAdmin work; their paths are only partly covered."),
+    ("LIMITED", "Alpine (version check only, no changelog/backport check); a Docker/Kubernetes HOST cannot see "
+                "inside images (run the script in each container or check the image tags); non-standard "
+                "web root or log paths (use --webroot / --access-log / --error-log)."),
+    ("NOT FOR", "Windows (IIS, XAMPP, WAMP), macOS, *BSD, shared hosting without shell access, managed PaaS "
+                "(use the provider's advisory)."),
+]
+
+
+def os_release():
+    d = {}
+    for line in read_text("/etc/os-release").splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            d[k] = v.strip().strip('"')
+    return d
+
+
+def check_environment(rep):
+    sec = "0. Environment and scope"
+    osr = os_release()
+    name = osr.get("PRETTY_NAME") or osr.get("NAME") or "unknown Linux"
+    mgr = [m for m in ("dpkg", "rpm", "apk") if shutil.which(m)]
+    cont = ""
+    try:
+        cg = read_text("/proc/1/cgroup")
+        if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv") or \
+                re.search(r"docker|kubepods|containerd|libpod|lxc", cg):
+            cont = "container (Docker/Podman/LXC/Kubernetes)"
+    except Exception:
+        pass
+    panels = [n for n, pth in (("Plesk", "/usr/local/psa"), ("cPanel", "/usr/local/cpanel"),
+                               ("DirectAdmin", "/usr/local/directadmin"), ("HestiaCP", "/usr/local/hestia"),
+                               ("LiteSpeed", "/usr/local/lsws")) if os.path.isdir(pth)]
+    id_all = (osr.get("ID", "") + " " + osr.get("ID_LIKE", "")).lower()
+    supported = bool(re.search(r"debian|ubuntu|rhel|fedora|centos|rocky|alma|amzn|suse|sles", id_all))
+    limited = "alpine" in id_all
+    verdict = "SUPPORTED" if supported else ("LIMITED" if limited else "UNKNOWN")
+    say("Reading /etc/os-release, checking for dpkg/rpm/apk, container markers and hosting panels ...")
+    say("Operating system : %s" % name)
+    say("Package manager  : %s" % (", ".join(mgr) or "none found (only version numbers can be judged)"))
+    say("Running inside   : %s" % (cont or "no container detected (bare metal or VM)"))
+    say("Hosting panels   : %s" % (", ".join(panels) or "none detected"))
+    say("Python           : %s" % sys.version.split()[0])
+    say("Suitability      : %s for this script" % verdict)
+    if cont:
+        say("Inside a container only THIS container is checked, not the host or other containers.")
+    if verdict == "UNKNOWN":
+        say("This distribution is not one the script was tested on; results may be incomplete.")
+    sev = "INFO" if verdict != "UNKNOWN" else "LOW"
+    rep.add(sev, sec, "Environment: %s; package manager: %s; %s; panels: %s; suitability: %s" %
+            (name, ", ".join(mgr) or "none", cont or "no container", ", ".join(panels) or "none", verdict),
+            ["%s: %s" % (k, v) for k, v in SCOPE_TEXT])
+    if limited:
+        rep.add("INFO", sec, "Alpine: PHP version is checked, but distro backports cannot be detected "
+                "(no changelog check), so a patched backport may be reported as vulnerable")
+    return verdict
 
 
 # --------------------------------------------------------------------------
@@ -229,6 +351,7 @@ def find_php_binaries():
             cands.append(p)
     patterns = ["/usr/bin/php*", "/usr/sbin/php-fpm*", "/usr/local/bin/php*", "/usr/local/sbin/php-fpm*",
                 "/opt/remi/php*/root/usr/bin/php*", "/opt/remi/php*/root/usr/sbin/php-fpm*",
+                "/opt/cpanel/ea-php*/root/usr/bin/php*", "/opt/cpanel/ea-php*/root/usr/sbin/php-fpm*",
                 "/opt/plesk/php/*/bin/php*", "/opt/plesk/php/*/sbin/php-fpm*",
                 "/usr/local/php*/bin/php*", "/usr/local/lsws/lsphp*/bin/lsphp"]
     for pat in patterns:
@@ -238,7 +361,6 @@ def find_php_binaries():
     for p in uniq_real(cands):
         if ok.match(os.path.basename(p)) and os.access(p, os.X_OK):
             out.append(p)
-    # keep also the names that users call (symlink names) for kind detection
     return out
 
 
@@ -261,10 +383,17 @@ def pkg_owner(path):
         rc, out = run(["rpm", "-qf", real, "--qf", "%{NAME}\n"])
         if rc == 0 and out.strip() and "not owned" not in out:
             return out.splitlines()[0].strip(), "rpm"
+    if shutil.which("apk"):
+        rc, out = run(["apk", "info", "-W", real])
+        m = re.search(r"owned by (\S+)", out)
+        if rc == 0 and m:
+            return re.sub(r"-\d.*$", "", m.group(1)), "apk"
     return None, None
 
 
 def pkg_version(pkg, mgr):
+    if mgr == "apk":
+        return ""
     if mgr == "dpkg":
         rc, out = run(["dpkg-query", "-W", "-f", "${Version}", pkg])
     else:
@@ -304,15 +433,31 @@ def assess(v, fixes):
 def check_php(rep):
     sec = "1. PHP versions"
     state = {"vulnerable": False, "found": False, "fpm_bins": []}
+    say("Searching standard locations for PHP executables (php, php-cgi, php-fpm, lsphp, Remi/Plesk/Docker-style paths) ...")
     bins = find_php_binaries()
+    say("Found %d PHP executable(s)%s" % (len(bins), ": " + ", ".join(bins) if bins else ""))
     for b in bins:
+        say("Running '%s -v' to read the exact PHP version" % b)
         v = php_version(b)
         if not v:
+            say("no PHP version could be read from this file, skipping it", 2)
             continue
+        say("version is %s" % fmt(v), 2)
         state["found"] = True
+        say("Asking the package manager (dpkg/rpm) which package owns this file ...", 2)
         pkg, mgr = pkg_owner(b)
-        fixes = changelog_cves(pkg, mgr) if pkg else set()
+        if pkg:
+            say("owned by package '%s' (%s)" % (pkg, mgr), 2)
+            say("Searching that package's changelog for %s / %s (a distro can backport the fix without "
+                "changing the version number) ..." % CVE_IDS, 2)
+            fixes = changelog_cves(pkg, mgr)
+            say("changelog mentions: %s" % (", ".join(sorted(fixes)) if fixes else "neither CVE"), 2)
+        else:
+            fixes = set()
+            say("not owned by a distro package (self-compiled, Docker image or vendor build), so only the "
+                "version number can be judged", 2)
         sev, text = assess(v, fixes)
+        say("verdict: [%s] %s" % (sev, text), 2)
         if SEV_RANK[sev] >= SEV_RANK["MEDIUM"]:
             state["vulnerable"] = True
         base = os.path.basename(b)
@@ -321,12 +466,16 @@ def check_php(rep):
         src = "package %s %s" % (pkg, pkg_version(pkg, mgr)) if pkg else "not from a distro package"
         rep.add(sev, sec, "%s: %s" % (b, text), ["source: " + src])
 
+    say("Searching for Apache mod_php modules (libphp*.so) ...")
     mods = []
     for pat in ("/usr/lib/apache2/modules/libphp*.so", "/usr/lib64/httpd/modules/libphp*.so",
                 "/usr/lib/httpd/modules/libphp*.so", "/opt/remi/php*/root/usr/lib64/httpd/modules/libphp*.so"):
         mods.extend(glob.glob(pat))
-    for m in uniq_real(mods):
+    mods = uniq_real(mods)
+    say("Found %d mod_php module(s)%s" % (len(mods), ": " + ", ".join(mods) if mods else ""))
+    for m in mods:
         state["found"] = True
+        say("Checking owner package and changelog of %s ..." % m, 2)
         pkg, mgr = pkg_owner(m)
         fixes = changelog_cves(pkg, mgr) if pkg else set()
         pv = pkg_version(pkg, mgr) if pkg else ""
@@ -337,6 +486,7 @@ def check_php(rep):
             sev, text = "INFO", "package changelog lists both CVEs: looks patched"
         else:
             sev, text = "MEDIUM", "cannot determine the upstream version; verify the package is patched"
+        say("package '%s' version '%s' -> [%s] %s" % (pkg, pv, sev, text), 2)
         if SEV_RANK[sev] >= SEV_RANK["MEDIUM"]:
             state["vulnerable"] = True
         rep.add(sev, sec, "mod_php %s: %s" % (m, text),
@@ -344,6 +494,9 @@ def check_php(rep):
 
     if not state["found"]:
         rep.add("INFO", sec, "No PHP binaries or mod_php modules found on this host")
+        say("No PHP found on this host.")
+    say("Note: containers and other hosts are NOT inspected by this step (check the image tag or run the "
+        "script inside the container).")
     rep.add("INFO", sec, "Containers and other hosts are NOT inspected here. Run the check inside each "
             "container image or check the image tag (fixed: %s)." % " / ".join(fmt(x) for x in FIXED.values()))
     return state
@@ -434,23 +587,37 @@ def parse_pools(files):
 def check_config(rep, vulnerable, state):
     sec = "2. PHP configuration"
     pool_users = set()
+    say("Looking for php.ini, conf.d/*.ini and PHP-FPM pool files (Debian/Ubuntu, RHEL, Remi and Docker layouts) ...")
     fams = ini_families()
+    say("Found %d configuration set(s)%s" % (len(fams), ": " + "; ".join(f[0] for f in fams) if fams else ""))
     if not fams:
         rep.add("INFO", sec, "No php.ini / pool configuration found in the usual locations")
+        say("Nothing to evaluate here (PHP not installed, or config lives in a non-standard place).")
     hint = "MEDIUM" if vulnerable else "LOW"
+    if vulnerable:
+        say("PHP in step 1 was judged vulnerable, so missing mitigations will be reported as MEDIUM.")
+    else:
+        say("PHP in step 1 was not judged vulnerable, so config findings are informational/low.")
     for label, files, pool_files in fams:
+        say("Reading %d ini file(s) and %d pool file(s) for '%s' ..." %
+            (len([f for f in files if os.path.isfile(f)]), len([f for f in pool_files if os.path.isfile(f)]), label))
         eff = parse_ini(files)
         pools, users = parse_pools(pool_files)
         pool_users |= users
         up_val = eff.get("session.upload_progress.enabled", ("1 (PHP default)", None))[0]
+        say("session.upload_progress.enabled in ini = %s  (the PHP2Shell upload path; advisory says to set 0)" % up_val, 2)
         summary = ["%s=%s" % (k, eff[k][0]) for k in INI_KEYS if k in eff]
+        if summary:
+            say("other tracked ini values: " + ", ".join(summary), 2)
         det = ["config files: " + ", ".join(sorted({v[1] for v in eff.values()})[:4]) if eff else
                "no explicit settings of the tracked keys found (PHP defaults apply)"]
         if summary:
             det.append("effective ini: " + ", ".join(summary))
         up_on = str(up_val).split()[0].lower() not in FALSE_VALUES
 
-        # per-pool upload_progress / memory_limit
+        if pools:
+            say("Checking each FPM pool for overrides (php_admin_value = enforced, php_value = app can "
+                "override) and pm.max_requests ...", 2)
         on_pools, mem_not_admin, php_value_mem, no_maxreq = [], [], [], []
         for (pname, pfile), info in pools.items():
             pool_up = None
@@ -475,9 +642,11 @@ def check_config(rep, vulnerable, state):
                 mem_not_admin.append(pname)
             if not info["max_requests"] or info["max_requests"] > 1:
                 no_maxreq.append(pname)
+            say("pool [%s]: upload_progress %s, memory_limit=-1 enforced: %s, pm.max_requests=%s" %
+                (pname, "ON" if eff_up else "off", "yes" if mem_admin else "no", info["max_requests"]), 3)
         if pools:
             det.append("FPM pools: %d (%s)" % (len(pools), ", ".join(sorted({p[0] for p in pools})[:8])))
-        if label.endswith("apache2 (Debian-style)") or "apache2" in label:
+        if "apache2" in label:
             det.append("mod_php: set values in php.ini or Apache config with php_admin_value, then restart Apache")
 
         sev = hint if (up_on and not pools) or on_pools else "INFO"
@@ -486,6 +655,7 @@ def check_config(rep, vulnerable, state):
             title += " (advisory mitigation: set it to 0 in php.ini/pool; advice is to keep it off even after patching)"
         if on_pools and pools:
             det.append("pools with upload_progress still on: " + ", ".join(on_pools[:10]))
+        say("verdict for '%s': [%s] upload_progress is %s" % (label, sev, "ON" if (up_on or on_pools) else "off"), 2)
         rep.add(sev, sec, title, det)
         if vulnerable:
             extra = []
@@ -502,16 +672,19 @@ def check_config(rep, vulnerable, state):
                 extra.append("PHP 8.5 only: also fatal_error_backtraces=0 (found: %s)" %
                              eff.get("fatal_error_backtraces", ("not set",))[0])
             if extra:
+                say("interim mitigations from the PHP advisory are not (fully) applied for '%s'" % label, 2)
                 rep.add("MEDIUM", sec, "%s: interim mitigations from the PHP advisory not (fully) applied; "
                         "these only reduce exposure, updating is the only complete fix" % label, extra)
 
-    # Apache config overrides
+    say("Scanning Apache configs (/etc/apache2, /etc/httpd) for php_admin_value/php_value overrides of "
+        "memory_limit or upload_progress ...")
     hits = []
     for pat in ("/etc/apache2/**/*.conf", "/etc/httpd/**/*.conf"):
         for f in glob.glob(pat, recursive=True):
             for ln, line in enumerate(read_text(f).splitlines(), 1):
                 if re.search(r"^\s*php_(admin_)?(value|flag)\s+(memory_limit|session\.upload_progress)", line):
                     hits.append("%s:%d: %s" % (f, ln, trunc(line.strip())))
+    say("found %d matching Apache directive(s)" % len(hits), 2)
     if hits:
         rep.add("INFO", sec, "Apache config sets mitigation-related PHP values", hits)
     return pool_users
@@ -555,12 +728,20 @@ def check_processes(rep):
     sec = "3. Processes and connections"
     if not os.path.isdir("/proc"):
         rep.add("LOW", sec, "/proc not available; process checks skipped")
+        say("/proc is not available, skipping.")
         return set()
+    say("Reading /proc to build a table of all running processes (pid, parent, name, owner) ...")
     t = proc_table()
     web = {pid for pid, p in t.items() if is_web(p["comm"])}
     web_users = {uname(t[p]["uid"]) for p in web if t[p]["uid"] != 0}
+    say("%d processes found, %d of them are web/PHP processes (php-fpm, apache2, httpd, nginx, lsphp, ...)" %
+        (len(t), len(web)))
+    if web:
+        names = Counter(t[p]["comm"] for p in web)
+        say("web/PHP processes by name: " + ", ".join("%s x%d" % kv for kv in names.most_common(8)), 2)
 
-    # replaced binaries still running
+    say("Checking whether any PHP worker still runs a binary or module that was REPLACED on disk (updating "
+        "the package without restarting leaves the old, vulnerable code in memory) ...")
     stale = defaultdict(list)
     for pid in web:
         comm = t[pid]["comm"]
@@ -574,12 +755,15 @@ def check_processes(rep):
             maps = read_text("/proc/%d/maps" % pid)
             if any("libphp" in ln and "(deleted)" in ln for ln in maps.splitlines()):
                 stale[comm].append(pid)
+    say("result: %s" % (", ".join("%s: %d process(es)" % (k, len(v)) for k, v in stale.items())
+                        if stale else "no stale PHP workers"), 2)
     for comm, pids in stale.items():
         rep.add("HIGH", sec, "%s: %d process(es) still run a replaced PHP binary/module (updated on disk but not "
                 "restarted, so STILL VULNERABLE in memory). Restart the service." % (comm, len(pids)),
                 ["pids: " + ", ".join(str(p) for p in sorted(pids)[:15])])
 
-    # suspicious children of web processes
+    say("Looking for shells (sh, bash, ...) and recon tools (whoami, id, nc, curl, base64, ...) that have a "
+        "web/PHP process among their ancestors - the typical footprint of a webshell or RCE ...")
     susp = defaultdict(list)
     for pid, p in t.items():
         name = p["comm"]
@@ -606,6 +790,8 @@ def check_processes(rep):
             sev = "HIGH"
         susp[sev].append("pid %d (parent chain via %s[%d]) user=%s: %s" %
                          (pid, parent_web["comm"], parent_web["pid"], uname(p["uid"]), trunc(cmd)))
+    say("result: %s" % (", ".join("%s: %d" % (k, len(v)) for k, v in susp.items()) if susp
+                        else "none right now (this is only a snapshot of this moment)"), 2)
     for sev, lines in susp.items():
         titles = {"HIGH": "Shell/recon tool spawned by a web or PHP process (typical post-exploitation)",
                   "MEDIUM": "Shell spawned by a web or PHP process (can be legitimate exec()/system())",
@@ -615,8 +801,9 @@ def check_processes(rep):
         rep.add("INFO", sec, "No shell or recon tool currently running below a web/PHP process "
                 "(only a snapshot of right now)")
 
-    # outbound connections from web processes
     if shutil.which("ss"):
+        say("Listing established TCP connections with 'ss' and picking outbound ones from web/PHP processes to "
+            "public IPs (attackers use these for reverse shells, downloads and data exfiltration) ...")
         rc, lis = run(["ss", "-H", "-tln"])
         listen_ports = set()
         for ln in lis.splitlines():
@@ -639,9 +826,12 @@ def check_processes(rep):
             if re.match(r"^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1|fe80|fd|169\.254\.)", ip):
                 continue
             conns.append("%s -> %s %s" % (local, peer, trunc(proc, 90)))
+        say("result: %d outbound connection(s) from web/PHP processes to public IPs" % len(conns), 2)
         if conns:
             rep.add("LOW", sec, "Outbound connections from web/PHP processes to public IPs "
                     "(often legitimate API calls; review unknown peers)", conns)
+    else:
+        say("'ss' is not installed, skipping the connection check.")
     return web_users
 
 
@@ -686,14 +876,27 @@ def scan_content(data, patterns):
 
 def check_files(rep, args, since_ts, web_users):
     sec = "4. Files"
+    say("Discovering web roots: common paths (/var/www, /srv, /home/*/public_html, ...) plus 'root' and "
+        "'DocumentRoot' directives in the nginx/Apache configs, plus any --webroot you passed ...")
     roots = discover_webroots(args.webroot)
+    say("Found %d web root(s)%s" % (len(roots), ": " + ", ".join(roots[:8]) + (" ..." if len(roots) > 8 else "")
+                                    if roots else ""))
     if not roots:
         rep.add("LOW", sec, "No web roots found; pass --webroot /path to scan one")
+    say("Walking every file (symlinks are not followed, max %d files). For each file changed since the cutoff "
+        "(or sitting in an upload/cache-like folder) the content is scanned for:" % args.max_files)
+    say("PHP code with eval(base64_decode(..)), system($_POST[..]), assert($_GET[..]), preg_replace /e, known "
+        "webshell names (FilesMan, c99, r57, b374k, WSO) and the PoC markers php2shell/JACKALPOC", 2)
+    say(".htaccess / .user.ini with auto_prepend_file, AddType php, or php_value overrides", 2)
+    say("images (jpg/png/gif/...) that actually contain '<?php'", 2)
+    say("recently changed executable files and any PHP file inside an uploads/cache/tmp/media-like folder", 2)
     finds = defaultdict(list)
     scanned = 0
     recent_code = 0
     limit_hit = False
     for root in roots:
+        say("Scanning %s ..." % root, 2)
+        before = scanned
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             rel_dir = os.path.relpath(dirpath, root)
@@ -739,10 +942,14 @@ def check_files(rep, args, since_ts, web_users):
                     finds["MEDIUM"].append("%s [%s] recently changed executable file in web root" % (path, stamp))
             if limit_hit:
                 break
+        say("%d files looked at in this root" % (scanned - before), 3)
         if limit_hit:
             break
     if limit_hit:
+        say("file limit reached; raise --max-files for complete coverage")
         rep.add("LOW", sec, "File limit reached (%d); raise --max-files for complete coverage" % args.max_files)
+    say("web roots done: %d files scanned, %d code files changed since the cutoff; findings HIGH=%d MEDIUM=%d "
+        "LOW=%d" % (scanned, recent_code, len(finds["HIGH"]), len(finds["MEDIUM"]), len(finds["LOW"])))
     titles = {"HIGH": "Webshell patterns / PHP hidden in files",
               "MEDIUM": "Suspicious files in web roots",
               "LOW": "Recently changed code files (legitimate updates and deployments are listed too)"}
@@ -752,7 +959,8 @@ def check_files(rep, args, since_ts, web_users):
     rep.add("INFO", sec, "Scanned %d files in %d web root(s): %s; %d code files changed since the cutoff" %
             (scanned, len(roots), ", ".join(roots[:6]) + (" ..." if len(roots) > 6 else ""), recent_code))
 
-    # temp dirs
+    say("Scanning /tmp, /var/tmp, /dev/shm (3 levels deep) for files changed since the cutoff that are owned by "
+        "a web user, executable, hidden, or ELF binaries - where attackers drop tools ...")
     uids = set()
     for u in web_users:
         try:
@@ -787,6 +995,7 @@ def check_files(rep, args, since_ts, web_users):
                 elif owned or (st.st_mode & 0o111) or fn.startswith("."):
                     why = "owned by web user" if owned else ("executable" if st.st_mode & 0o111 else "hidden file")
                     tmpf.append(("MEDIUM", "%s (%s)" % (path, why)))
+    say("result: %d suspicious file(s) in temp directories" % len(tmpf), 2)
     for sev in ("HIGH", "MEDIUM"):
         lines = [t[1] for t in tmpf if t[0] == sev]
         if lines:
@@ -800,6 +1009,8 @@ def check_persistence(rep, since_ts, web_users, pool_users):
     sec = "5. Persistence and system changes"
     users = set(web_users) | set(pool_users) | {"www-data", "apache", "nginx", "wwwrun", "www", "httpd"}
     users = {u for u in users if u}
+    say("Checking the web/PHP service accounts (%s) for crontabs, SSH authorized_keys and login shells - a "
+        "web user normally has none of these ..." % ", ".join(sorted(users)))
     for u in sorted(users):
         try:
             pw = pwd.getpwnam(u)
@@ -809,28 +1020,39 @@ def check_persistence(rep, since_ts, web_users, pool_users):
             if os.path.isfile(cp) and read_text(cp).strip():
                 lines = [l for l in read_text(cp).splitlines() if l.strip() and not l.startswith("#")]
                 if lines:
+                    say("account '%s' HAS a crontab (%d entries)" % (u, len(lines)), 2)
                     rep.add("MEDIUM", sec, "Web user '%s' has a crontab (unusual unless you set it up)" % u,
                             [trunc(l) for l in lines[:8]])
         ak = os.path.join(pw.pw_dir, ".ssh", "authorized_keys")
         if os.path.isfile(ak) and os.path.getsize(ak) > 0:
+            say("account '%s' HAS authorized_keys: %s" % (u, ak), 2)
             rep.add("MEDIUM", sec, "Web user '%s' has authorized_keys: %s" % (u, ak),
                     ["modified: " + time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(ak)))])
         if pw.pw_shell and not pw.pw_shell.endswith(("nologin", "false")) and u in ("www-data", "apache", "nginx", "wwwrun"):
+            say("account '%s' has a login shell (%s)" % (u, pw.pw_shell), 2)
             rep.add("LOW", sec, "Web user '%s' has a login shell (%s)" % (u, pw.pw_shell))
 
+    say("Checking /etc/ld.so.preload (libraries injected into every process; a classic rootkit location) ...")
     pre = "/etc/ld.so.preload"
     if os.path.isfile(pre) and read_text(pre).strip():
+        say("/etc/ld.so.preload is PRESENT and not empty", 2)
         rep.add("HIGH", sec, "/etc/ld.so.preload is present and non-empty (classic rootkit/hook location)",
                 [trunc(l) for l in read_text(pre).splitlines()[:5]])
+    else:
+        say("not present / empty - OK", 2)
 
+    say("Checking /etc/passwd for additional accounts with UID 0 (root-equivalent backdoor accounts) ...")
     uid0 = []
     for line in read_text("/etc/passwd").splitlines():
         p = line.split(":")
         if len(p) > 3 and p[2] == "0" and p[0] != "root":
             uid0.append(line)
+    say("%s" % ("FOUND: " + "; ".join(uid0) if uid0 else "only 'root' has UID 0 - OK"), 2)
     if uid0:
         rep.add("HIGH", sec, "Additional account(s) with UID 0", uid0)
 
+    say("Checking whether sensitive system files changed since the cutoff (passwd, shadow, sudoers, cron, "
+        "systemd units, rc.local, profile.d, init.d, sshd_config, root authorized_keys) ...")
     watch = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/crontab", "/etc/rc.local",
              "/root/.ssh/authorized_keys", "/etc/ssh/sshd_config", "/etc/environment"]
     for pat in ("/etc/sudoers.d/*", "/etc/cron.d/*", "/etc/cron.hourly/*", "/etc/cron.daily/*",
@@ -845,6 +1067,8 @@ def check_persistence(rep, since_ts, web_users, pool_users):
             continue
         if max(st.st_mtime, st.st_ctime) >= since_ts:
             changed.append("%s [%s]" % (f, time.strftime("%Y-%m-%d %H:%M", time.localtime(max(st.st_mtime, st.st_ctime)))))
+    say("%d of %d watched files changed since the cutoff (package updates and your own edits appear here too)" %
+        (len(changed), len(set(watch))), 2)
     if changed:
         rep.add("MEDIUM", sec, "System files changed since the cutoff (package updates and your own changes "
                 "appear here too; verify each)", changed)
@@ -894,10 +1118,24 @@ ERROR_GLOBS = ["/var/log/php*fpm*.log*", "/var/log/php-fpm/*.log*", "/var/log/ph
 
 def check_access_logs(rep, args, since_ts):
     sec = "6. Logs: access"
+    say("Collecting access logs (nginx, Apache, lighttpd, Caddy, LiteSpeed, Plesk paths + your --access-log "
+        "globs). Rotated .gz files are read too; files last written before the cutoff are skipped ...")
     files = log_files(ACCESS_GLOBS + args.access_log, since_ts)
+    say("%d access log file(s) selected%s" % (len(files), ": " + ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
+                                              if files else ""))
     if not files:
         rep.add("LOW", sec, "No access logs found in the usual locations; pass --access-log '/path/*.log*'")
         return
+    say("Parsing every line (combined log format, with or without a leading vhost field) and applying these "
+        "checks to lines newer than the cutoff:")
+    say("known PoC markers ('php2shell', 'JACKALPOC') anywhere in the line", 2)
+    say("'upload_progress' in the URL or referer (the exploit field itself normally sits in the body, "
+        "which access logs do not show)", 2)
+    say("POST requests answered with HTTP 5xx (a crashing worker is a typical exploit side effect)", 2)
+    say("POST requests with an empty or very short User-Agent", 2)
+    say("PHPSESSID in the URL of non-POST requests", 2)
+    say("successful requests to .php files inside upload/cache/tmp/media-like folders (webshell use)", 2)
+    say("bursts of POST requests per IP per minute (brute-forcing / ASLR guessing / scanning)", 2)
     counts = Counter()
     ipc = defaultdict(Counter)
     samples = defaultdict(list)
@@ -912,9 +1150,12 @@ def check_access_logs(rep, args, since_ts):
             samples[cat].append(trunc(line.strip(), 260))
 
     for path in files:
+        say("Reading %s ..." % path, 2)
+        l0, p0 = lines_total, parsed
         try:
             fh = open_log(path)
-        except Exception:
+        except Exception as e:  # noqa
+            say("cannot open (%s), skipping" % e, 3)
             continue
         with fh:
             try:
@@ -952,17 +1193,23 @@ def check_access_logs(rep, args, since_ts):
                         rec("php_in_uploads", line, ip)
             except Exception:
                 continue
+        say("%d lines read, %d inside the time range" % (lines_total - l0, parsed - p0), 3)
 
     cov = "no matching lines"
     if first_ts:
         cov = "%s .. %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(first_ts)),
                             time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts)))
+    say("Coverage of the parsed lines: %s. If this starts later than your cutoff, older logs were rotated away "
+        "and that period cannot be checked." % cov)
     rep.add("INFO", sec, "Read %d log files, %d lines (%d parsed in range). Coverage: %s" %
             (len(files), lines_total, parsed, cov), files[:12])
 
     def top_ips(cat):
         return "top IPs: " + ", ".join("%s(%d)" % kv for kv in ipc[cat].most_common(5))
 
+    say("Hit counts: PoC markers=%d, upload_progress=%d, PHP-in-uploads=%d, POST-5xx=%d, empty-UA POST=%d, "
+        "PHPSESSID-in-URL=%d" % (counts["poc"], counts["upload_progress"], counts["php_in_uploads"],
+                                 counts["post500"], counts["emptyua"], counts["phpsessid_url"]))
     if counts["poc"]:
         rep.add("HIGH", sec, "Known PoC markers (php2shell / JACKALPOC) in requests: %d (attempts; check these hosts "
                 "for follow-on activity)" % counts["poc"], [top_ips("poc")] + samples["poc"])
@@ -986,6 +1233,7 @@ def check_access_logs(rep, args, since_ts):
         rep.add("LOW", sec, "GET/other requests with PHPSESSID in the URL: %d" % counts["phpsessid_url"],
                 [top_ips("phpsessid_url")] + samples["phpsessid_url"])
     big = [(k, v) for k, v in burst.items() if v >= args.burst]
+    say("Counting POSTs per IP per minute (threshold %d): %d burst(s) found" % (args.burst, len(big)))
     if big:
         big.sort(key=lambda kv: -kv[1])
         lines = ["%s: %d POSTs in one minute (%s)" % (k[0], v, time.strftime("%Y-%m-%d %H:%M", time.localtime(k[1] * 60)))
@@ -1036,17 +1284,26 @@ def err_ts(line):
 
 
 def check_error_logs(rep, args, since_ts):
-    sec = "6b. Logs: error / syslog"
+    sec = "7. Logs: error / syslog"
+    say("Collecting PHP, FPM, Apache and nginx error logs plus syslog/messages/kern.log (+ your --error-log "
+        "globs) that were written since the cutoff ...")
     files = log_files(ERROR_GLOBS + args.error_log, since_ts)
+    say("%d error/syslog file(s) selected%s" % (len(files), ": " + ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
+                                                if files else ""))
     if not files:
         rep.add("LOW", sec, "No PHP/web error logs found in the usual locations; pass --error-log '/path/*.log*'")
         return
+    say("Searching every line for: memory exhaustion 'in Unknown on line 0' and PHP fatals outside any script "
+        "(the reported PHP2Shell signature), worker crashes (Apache AH00052, 'exited on signal 11', SIGSEGV), "
+        "kernel segfaults in PHP/web processes, and plain memory/timeout errors (informational) ...")
     counts = Counter()
     samples = defaultdict(list)
     for path in files:
+        say("Reading %s ..." % path, 2)
         try:
             fh = open_log(path)
-        except Exception:
+        except Exception as e:  # noqa
+            say("cannot open (%s), skipping" % e, 3)
             continue
         with fh:
             try:
@@ -1062,6 +1319,7 @@ def check_error_logs(rep, args, since_ts):
                             break
             except Exception:
                 continue
+    say("Hit counts: " + ", ".join("%s=%d" % (n, counts[n]) for n, _, _ in ERR_PATTERNS))
     rep.add("INFO", sec, "Read %d error/syslog files" % len(files), files[:12])
     shown = False
     for name, sev, _ in ERR_PATTERNS:
@@ -1078,6 +1336,63 @@ def check_error_logs(rep, args, since_ts):
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
+STEP_TEXT = {
+    1: ("PHP versions and patch status",
+        "Finds every PHP executable and Apache mod_php module, reads its version, asks dpkg/rpm which package "
+        "owns it and searches that package's changelog for the two CVE ids (distros often backport the fix "
+        "without changing the version number).",
+        "Only a patched PHP is a complete fix: 8.5.12, 8.4.27, 8.3.36 or 8.2.35 (or a vendor backport). "
+        "Everything else below only matters in relation to this result.",
+        "version is below the fixed release and no backport is found (HIGH); branch is end-of-life (HIGH); "
+        "changelog mentions only one CVE (MEDIUM)."),
+    2: ("PHP configuration (interim mitigations)",
+        "Reads php.ini, conf.d and every PHP-FPM pool to see session.upload_progress.enabled, memory_limit, "
+        "post_max_size, fatal_error_backtraces and pm.max_requests, and whether values are enforced "
+        "(php_admin_value) or overridable (php_value).",
+        "The PHP advisory lists these settings as stop-gaps that reduce exposure to specific attack paths "
+        "while you cannot update. upload_progress should stay off even after patching.",
+        "upload_progress is on; memory_limit=-1 is not enforced per pool; pm.max_requests is not 1 "
+        "(MEDIUM when PHP is vulnerable, otherwise low/info)."),
+    3: ("Running processes and network connections",
+        "Reads /proc: finds PHP workers still running a replaced binary, shells/recon tools started below a "
+        "web or PHP process, and outbound TCP connections from web processes to public IPs.",
+        "Patching without restarting leaves the vulnerable code in memory, and a successful exploit usually "
+        "shows up as a web worker spawning a shell or calling out to the internet.",
+        "stale worker (HIGH); shell with recon commands or whoami/id/nc under a web process (HIGH); plain "
+        "shell (MEDIUM); outbound connection to a public IP (LOW, review the peer)."),
+    4: ("Web root files, webshells and temp directories",
+        "Walks all web roots and scans files changed since the cutoff (and everything in upload/cache-like "
+        "folders) for webshell code, hidden PHP in images, malicious .htaccess/.user.ini, then inspects "
+        "/tmp, /var/tmp and /dev/shm for dropped tools.",
+        "Updating PHP does not remove a webshell that was planted earlier. File evidence is stronger proof of "
+        "compromise than any log line.",
+        "eval(base64_decode()), system($_POST[]) and similar (HIGH); PHP inside images (HIGH); "
+        "auto_prepend_file (HIGH); PHP in upload folders or new executables (MEDIUM); ELF files owned by the "
+        "web user in /tmp (HIGH)."),
+    5: ("Persistence and system changes",
+        "Checks crontabs, SSH keys and login shells of web accounts, /etc/ld.so.preload, extra UID 0 accounts, "
+        "and whether passwd, shadow, sudoers, cron, systemd units and similar files changed since the cutoff.",
+        "After code execution attackers typically add a way back in. Web accounts normally have none of these.",
+        "ld.so.preload content or a second UID 0 account (HIGH); web user with crontab/authorized_keys or a "
+        "changed system file (MEDIUM - package updates also change files, so verify)."),
+    6: ("Access logs",
+        "Parses nginx/Apache access logs (including rotated .gz) from the cutoff date onward and counts PoC "
+        "markers, upload_progress in URLs, POST 5xx, empty User-Agent POSTs, PHPSESSID in URLs, requests to "
+        "PHP files in upload folders and POST bursts per IP.",
+        "Shows who is probing or attacking and from where. The earliest reported attempt was 17 October, so "
+        "that is the default cutoff.",
+        "PoC markers (HIGH); upload_progress, PHP-in-uploads, POST 5xx from one IP >= 10, POST bursts "
+        "(MEDIUM); other patterns (LOW). A hit is an attempt, not a compromise."),
+    7: ("Error logs and syslog",
+        "Searches PHP/FPM/Apache/nginx error logs and syslog for memory exhaustion 'in Unknown on line 0', "
+        "fatal errors outside any script, worker crashes and kernel segfaults in PHP or web processes.",
+        "The exploits work by driving PHP into memory errors and crashes, which are logged even when the "
+        "request body is not.",
+        "'in Unknown on line 0' errors and repeated crashes/segfaults (MEDIUM); ordinary memory or timeout "
+        "errors (LOW)."),
+}
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="Local read-only checker for PHP2Shell (CVE-2026-109618 / CVE-2026-109619)")
     ap.add_argument("--since", default=DEFAULT_SINCE,
@@ -1085,19 +1400,23 @@ def parse_args():
     ap.add_argument("--webroot", action="append", default=[], help="extra web root to scan (repeatable)")
     ap.add_argument("--access-log", action="append", default=[], help="extra access log glob (repeatable)")
     ap.add_argument("--error-log", action="append", default=[], help="extra error log glob (repeatable)")
-    ap.add_argument("--skip-files", action="store_true", help="skip file/webshell scan")
-    ap.add_argument("--skip-logs", action="store_true", help="skip log scan")
-    ap.add_argument("--skip-procs", action="store_true", help="skip process/persistence checks")
+    ap.add_argument("--skip-files", action="store_true", help="skip step 4 (file/webshell scan)")
+    ap.add_argument("--skip-logs", action="store_true", help="skip steps 6 and 7 (logs)")
+    ap.add_argument("--skip-procs", action="store_true", help="skip steps 3 and 5 (processes, persistence)")
     ap.add_argument("--max-files", type=int, default=400000, help="max files to walk in web roots")
     ap.add_argument("--burst", type=int, default=60, help="POSTs per minute per IP to flag as a burst")
     ap.add_argument("--sample", type=int, default=12, help="detail lines per finding on screen")
     ap.add_argument("--json", metavar="FILE", help="write the full report as JSON")
+    ap.add_argument("--quiet", action="store_true", help="no step narration, only the final report")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--version", action="version", version="php2shell_check %s (%s)" % (__version__, VERSION_DATE))
     return ap.parse_args()
 
 
 def main():
+    global QUIET
     args = parse_args()
+    QUIET = args.quiet
     try:
         since = dt.datetime.strptime(args.since, "%Y-%m-%d")
     except ValueError:
@@ -1105,32 +1424,79 @@ def main():
         return 3
     since_ts = time.mktime(since.timetuple())
     rep = Report(sys.stdout.isatty() and not args.no_color)
+    total = len(STEP_TEXT)
 
-    print("php2shell_check - CVE-2026-109618 / CVE-2026-109619")
-    print("host=%s  user=%s  time=%s  since=%s" % (socket.gethostname(), uname(os.geteuid()),
-                                                  time.strftime("%Y-%m-%d %H:%M"), args.since))
+    print("php2shell_check v%s (%s) - CVE-2026-109618 / CVE-2026-109619  (read-only, nothing is changed or sent)" %
+          (__version__, VERSION_DATE))
+    print("host=%s  user=%s  time=%s  checking from=%s" % (socket.gethostname(), uname(os.geteuid()),
+                                                          time.strftime("%Y-%m-%d %H:%M"), args.since))
     if not sys.platform.startswith("linux"):
         print("This checker supports Linux only.", file=sys.stderr)
         return 3
     if os.geteuid() != 0:
         rep.add("MEDIUM", "0. Notes", "Not running as root: logs, /proc of other users and many files will be "
                 "unreadable, so results are incomplete. Re-run with sudo.")
+        print("WARNING: not running as root - logs, /proc of other users and many files will be unreadable, "
+              "so results will be incomplete. Re-run with sudo.")
 
-    state = safe(rep, "1. PHP versions", check_php, rep) or {"vulnerable": False, "found": False, "fpm_bins": []}
-    pool_users = safe(rep, "2. PHP configuration", check_config, rep, state["vulnerable"], state) or set()
-    web_users = set()
-    if not args.skip_procs:
-        web_users = safe(rep, "3. Processes and connections", check_processes, rep) or set()
-    if not args.skip_files:
-        safe(rep, "4. Files", check_files, rep, args, since_ts, web_users | pool_users)
-    if not args.skip_procs:
-        safe(rep, "5. Persistence and system changes", check_persistence, rep, since_ts, web_users, pool_users)
-    if not args.skip_logs:
-        safe(rep, "6. Logs: access", check_access_logs, rep, args, since_ts)
-        safe(rep, "6b. Logs: error / syslog", check_error_logs, rep, args, since_ts)
+    if not QUIET:
+        print("\nSCOPE - which systems this script is suitable for:")
+        for k, v in SCOPE_TEXT:
+            print(labelled(k, v))
+        print("\nDETECTED ON THIS HOST:")
+    safe(rep, "0. Environment and scope", check_environment, rep)
 
+    skip = {3: args.skip_procs, 5: args.skip_procs, 4: args.skip_files, 6: args.skip_logs, 7: args.skip_logs}
+    if not QUIET:
+        print("\nPLAN - this run will perform the following steps:")
+        for n in range(1, total + 1):
+            print("  %d. %s%s" % (n, STEP_TEXT[n][0], "   [SKIPPED by option]" if skip.get(n) else ""))
+
+    results = {}
+
+    def step(n, fn, *a):
+        title, what, why, flagged = STEP_TEXT[n]
+        if skip.get(n):
+            banner(n, total, title, what, why, flagged)
+            say("SKIPPED because of a --skip-* option")
+            results[n] = None
+            return None
+        banner(n, total, title, what, why, flagged)
+        start = len(rep.items)
+        out = safe(rep, "%d. %s" % (n, title), fn, *a)
+        c = Counter(i["severity"] for i in rep.items[start:])
+        results[n] = c
+        if not QUIET:
+            print("-" * 78)
+            worst = max([SEV_RANK[k] for k in c] or [0])
+            verdict = {3: "ATTENTION - HIGH finding(s)", 2: "REVIEW - MEDIUM finding(s)", 1: "minor items only",
+                       0: "nothing to report"}[worst]
+            print("  STEP %d RESULT: HIGH=%d MEDIUM=%d LOW=%d INFO=%d  ->  %s" %
+                  (n, c["HIGH"], c["MEDIUM"], c["LOW"], c["INFO"], verdict))
+        return out
+
+    state = step(1, check_php, rep) or {"vulnerable": False, "found": False, "fpm_bins": []}
+    pool_users = step(2, check_config, rep, state["vulnerable"], state) or set()
+    web_users = step(3, check_processes, rep) or set()
+    step(4, check_files, rep, args, since_ts, web_users | pool_users)
+    step(5, check_persistence, rep, since_ts, web_users, pool_users)
+    step(6, check_access_logs, rep, args, since_ts)
+    step(7, check_error_logs, rep, args, since_ts)
+
+    print("\n" + "=" * 78)
+    print("FINAL REPORT (all findings, grouped by step)")
+    print("=" * 78)
     rep.print(args.sample)
     c = rep.counts()
+
+    print("\n== Checklist ==")
+    for n in range(1, total + 1):
+        r = results.get(n)
+        if r is None:
+            print("  step %d  %-48s SKIPPED" % (n, STEP_TEXT[n][0]))
+        else:
+            print("  step %d  %-48s HIGH=%d MEDIUM=%d LOW=%d" % (n, STEP_TEXT[n][0], r["HIGH"], r["MEDIUM"], r["LOW"]))
+
     print("\n== Summary ==")
     print("HIGH=%d  MEDIUM=%d  LOW=%d  INFO=%d" % (c["HIGH"], c["MEDIUM"], c["LOW"], c["INFO"]))
     print("Updating PHP (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35) and restarting all workers is the only complete fix.")
@@ -1139,7 +1505,7 @@ def main():
     if args.json:
         try:
             with open(args.json, "w") as f:
-                json.dump({"host": socket.gethostname(), "since": args.since, "summary": c, "items": rep.items},
+                json.dump({"script_version": __version__, "script_date": VERSION_DATE, "host": socket.gethostname(), "since": args.since, "summary": c, "items": rep.items},
                           f, indent=2)
             print("JSON report written to %s" % args.json)
         except Exception as e:  # noqa
@@ -1148,4 +1514,14 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:  # e.g. output piped into head/less and closed early
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+        sys.exit(0)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
