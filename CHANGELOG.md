@@ -2,6 +2,24 @@
 
 All notable changes to `php2shell_check.py`. The format follows [Keep a Changelog](https://keepachangelog.com/); versions follow semantic versioning, where the command-line options and the report format are the public interface.
 
+## [2.2.0] - 2026-10-22
+
+### Added
+- ISO-8601 (bracketed) and JSON-lines access logs (Caddy, nginx json), in addition to combined/common log format.
+- Classic syslog lines without a year are parsed (most recent past date assumed); continuation lines inherit the previous timestamp.
+- MEDIUM warning when fewer than half of the lines of an access log can be parsed.
+- `--since` accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` and `DD.MM.YYYY`; layouts with slashes are refused because day/month order would be a guess; dates in the future are refused.
+- Files with a modification time in the future are flagged (possible timestamp manipulation); the change time (ctime) is used for the cutoff.
+
+### Changed
+- All timestamp output goes through one helper that never raises; month names are read from a fixed English table, independent of the host locale.
+
+### Fixed
+- A forged or corrupt file timestamp (huge, negative, NaN) could abort a whole scan step.
+- Access-log lines with an ISO timestamp were silently dropped instead of parsed.
+- Syslog lines without a year were counted regardless of the cutoff, producing false positives from old entries.
+- The shell-history check used only `mtime`; it now uses `max(mtime, ctime)`.
+
 ## [2.1.0] - 2026-10-22
 
 ### Added

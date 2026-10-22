@@ -4,9 +4,14 @@
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
 (CVE-2026-109618 / CVE-2026-109619).
 
-Version 2.1.0 (2026-10-22)
+Version 2.2.0 (2026-10-22)
 
 Changelog
+  2.2.0  2026-10-22  Date handling hardened: never crashes on forged/huge timestamps (fts), locale-independent
+                     month parsing, ISO-8601 and JSON (Caddy/nginx) access logs, syslog lines without a year,
+                     continuation lines inherit the previous timestamp, warning when a log format is not
+                     recognised, --since accepts YYYY-MM-DD / DD.MM.YYYY / 'YYYY-MM-DD HH:MM' and rejects
+                     ambiguous layouts, future file mtimes flagged (ctime used for the cutoff).
   2.1.0  2026-10-22  Step 5 also reads shell history files (bash/zsh) of all accounts: reverse shells,
                      download-and-run, decode-and-run, temp-dir execution, history tampering, PoC markers;
                      a history file on a web account is flagged by itself; secrets are masked on screen.
@@ -62,6 +67,7 @@ Exit code: 2 = at least one HIGH finding, 1 = at least one MEDIUM, 0 = else.
 """
 
 import argparse
+import calendar
 import datetime as dt
 import functools
 import glob
@@ -84,7 +90,7 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 VERSION_DATE = "2026-10-22"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 
@@ -244,6 +250,20 @@ def read_bytes(path, limit):
 
 def fmt(v):
     return ".".join(str(x) for x in v)
+
+
+NOW = time.time()
+
+
+def fts(ts):
+    """Epoch seconds -> 'YYYY-MM-DD HH:MM' in host local time. Never raises: a forged or corrupt timestamp
+    (huge, negative, NaN) would otherwise abort a whole step. Output is numeric ISO order, so no locale effects."""
+    if ts is None or isinstance(ts, bool):
+        return "n/a"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "invalid time (%r)" % (ts,)
 
 
 def trunc(s, n=220):
@@ -918,8 +938,12 @@ def check_files(rep, args, since_ts, web_users):
                 ext = os.path.splitext(fn)[1].lower()
                 rel = os.path.join(rel_dir, fn)
                 recent = max(st.st_mtime, st.st_ctime) >= since_ts
+                if st.st_mtime > NOW + 86400 and len(finds["MEDIUM"]) < 500:
+                    finds["MEDIUM"].append("%s modification time is in the future (%s): possible timestamp "
+                                           "manipulation (the change time ctime is used for the cutoff instead)" %
+                                           (path, fts(st.st_mtime)))
                 in_upload = bool(UPLOAD_RE.search(rel.replace(os.sep, "/")))
-                stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(max(st.st_mtime, st.st_ctime)))
+                stamp = fts(max(st.st_mtime, st.st_ctime))
 
                 if ext in PHPEXT:
                     if recent:
@@ -1070,13 +1094,13 @@ def check_shell_history(rep, sec, web_users, since_ts):
                 continue
             if st.st_size == 0:
                 continue
-            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+            stamp = fts(max(st.st_mtime, st.st_ctime))
             if isweb:
                 say("web account '%s' HAS a history file %s (%d bytes, modified %s)" % (user, path, st.st_size, stamp), 2)
                 found["MEDIUM"].append("%s: web account has a shell history file (%d bytes, modified %s). Such accounts "
                                        "normally have none; this means an interactive shell was used" %
                                        (path, st.st_size, stamp))
-            if st.st_mtime < since_ts:
+            if max(st.st_mtime, st.st_ctime) < since_ts:
                 continue
             try:
                 with open(path, "rb") as f:
@@ -1103,7 +1127,7 @@ def check_shell_history(rep, sec, web_users, since_ts):
                     continue
                 for label, rx in HIST_PATTERNS:
                     if rx.search(line):
-                        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "no timestamp"
+                        when = fts(ts) if ts else "no timestamp"
                         if not ts:
                             no_ts = True
                         sev = "HIGH" if isweb else "MEDIUM"
@@ -1151,7 +1175,7 @@ def check_persistence(rep, since_ts, web_users, pool_users):
         if os.path.isfile(ak) and os.path.getsize(ak) > 0:
             say("account '%s' HAS authorized_keys: %s" % (u, ak), 2)
             rep.add("MEDIUM", sec, "Web user '%s' has authorized_keys: %s" % (u, ak),
-                    ["modified: " + time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(ak)))])
+                    ["modified: " + fts(os.path.getmtime(ak))])
         if pw.pw_shell and not pw.pw_shell.endswith(("nologin", "false")) and u in ("www-data", "apache", "nginx", "wwwrun"):
             say("account '%s' has a login shell (%s)" % (u, pw.pw_shell), 2)
             rep.add("LOW", sec, "Web user '%s' has a login shell (%s)" % (u, pw.pw_shell))
@@ -1192,7 +1216,7 @@ def check_persistence(rep, since_ts, web_users, pool_users):
         except Exception:
             continue
         if max(st.st_mtime, st.st_ctime) >= since_ts:
-            changed.append("%s [%s]" % (f, time.strftime("%Y-%m-%d %H:%M", time.localtime(max(st.st_mtime, st.st_ctime)))))
+            changed.append("%s [%s]" % (f, fts(max(st.st_mtime, st.st_ctime))))
     say("%d of %d watched files changed since the cutoff (package updates and your own edits appear here too)" %
         (len(changed), len(set(watch))), 2)
     if changed:
@@ -1205,12 +1229,113 @@ def check_persistence(rep, since_ts, web_users, pool_users):
 # --------------------------------------------------------------------------
 # 6. logs
 # --------------------------------------------------------------------------
+MONTHS = {m: i for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct",
+                                      "Nov", "Dec"], 1)}
+CLF_TS = re.compile(r"^(\d{1,2})/([A-Za-z]{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2})(?: ([+-])(\d{2}):?(\d{2}))?$")
+ISO_TS = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?\s*(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def to_epoch(y, mo, d, H, M, S, off=None):
+    """Calendar fields -> epoch seconds. off = UTC offset in seconds, None = host local time.
+    Returns None for impossible values instead of guessing."""
+    if not (1970 <= y <= 2100 and 1 <= mo <= 12 and 1 <= d <= 31 and 0 <= H <= 23 and 0 <= M <= 59 and 0 <= S <= 60):
+        return None
+    try:
+        if off is None:
+            return time.mktime((y, mo, d, H, M, S, 0, 0, -1))
+        return float(calendar.timegm((y, mo, d, H, M, S)) - off)
+    except (OverflowError, ValueError, OSError):
+        return None
+
+
 @functools.lru_cache(maxsize=8192)
 def parse_access_ts(s):
+    """Parse a log timestamp in one of the known layouts. Month names are matched against a fixed English table
+    (nginx/Apache always log English month names), so the host locale cannot break parsing. Day-first and
+    year-first layouts are told apart by their shape; ambiguous layouts such as 10/22/2026 are not guessed."""
+    s = s.strip()
+    m = CLF_TS.match(s)
+    if m:
+        d, mon, y, H, M, S, sg, oh, om = m.groups()
+        mo = MONTHS.get(mon.title())
+        if not mo:
+            return None
+        off = None
+        if sg:
+            off = (int(oh) * 3600 + int(om) * 60) * (1 if sg == "+" else -1)
+        return to_epoch(int(y), mo, int(d), int(H), int(M), int(S), off)
+    m = ISO_TS.match(s)
+    if m:
+        y, mo, d, H, M, S, tz = m.groups()
+        off = None
+        if tz:
+            off = 0 if tz == "Z" else (int(tz[1:3]) * 3600 + int(tz[-2:]) * 60) * (1 if tz[0] == "+" else -1)
+        return to_epoch(int(y), int(mo), int(d), int(H), int(M), int(S), off)
+    if re.match(r"^\d{9,11}(\.\d+)?$", s):
+        return float(s)
+    return None
+
+
+def _first(*vals):
+    for v in vals:
+        if v not in (None, "", []):
+            return v
+    return None
+
+
+def parse_json_access(line):
+    """Parse one JSON access-log line (Caddy, nginx json_log, Traefik-style). Returns
+    (ip, epoch, request_line, status, user_agent, referer) or None if the line is not recognised."""
     try:
-        return dt.datetime.strptime(s, "%d/%b/%Y:%H:%M:%S %z").timestamp()
-    except Exception:
+        o = json.loads(line)
+    except ValueError:
         return None
+    if not isinstance(o, dict):
+        return None
+    rq = o.get("request") if isinstance(o.get("request"), dict) else {}
+    hd = rq.get("headers") if isinstance(rq.get("headers"), dict) else {}
+    raw = _first(o.get("ts"), o.get("time"), o.get("@timestamp"), o.get("timestamp"), o.get("time_iso8601"),
+                 o.get("time_local"))
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        ts = float(raw) / 1000.0 if raw > 1e11 else float(raw)
+    elif isinstance(raw, str):
+        ts = parse_access_ts(raw)
+    else:
+        ts = None
+    if ts is None:
+        return None
+    try:
+        status = int(_first(o.get("status"), o.get("resp_status"), o.get("status_code")))
+    except (TypeError, ValueError):
+        return None
+    ip = str(_first(rq.get("remote_ip"), rq.get("client_ip"), o.get("remote_addr"), o.get("remote_ip"),
+                    o.get("client_ip"), "-"))
+    if isinstance(o.get("request"), str):
+        reqline = o["request"]
+    else:
+        reqline = "%s %s HTTP" % (_first(rq.get("method"), o.get("method"), o.get("request_method"), "-"),
+                                  _first(rq.get("uri"), o.get("uri"), o.get("request_uri"), o.get("path"), "-"))
+    ua = _first(hd.get("User-Agent"), o.get("http_user_agent"), o.get("user_agent")) or ""
+    ref = _first(hd.get("Referer"), o.get("http_referer")) or ""
+    if isinstance(ua, list):
+        ua = ua[0] if ua else ""
+    if isinstance(ref, list):
+        ref = ref[0] if ref else ""
+    return ip, ts, str(reqline), status, str(ua), str(ref)
+
+
+def parse_since(text):
+    """--since accepts YYYY-MM-DD, 'YYYY-MM-DD HH:MM' and DD.MM.YYYY. Layouts with slashes (10/22/2026) are
+    rejected on purpose: day/month order would be a guess."""
+    t = text.strip()
+    for fmt_, rx in (("%Y-%m-%d", r"\d{4}-\d{2}-\d{2}"), ("%Y-%m-%d %H:%M", r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}"),
+                     ("%Y-%m-%dT%H:%M", r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"), ("%d.%m.%Y", r"\d{1,2}\.\d{1,2}\.\d{4}")):
+        if re.match("^" + rx + "$", t):
+            d = dt.datetime.strptime(t, fmt_)
+            if not 2000 <= d.year <= 2100:
+                raise ValueError("year out of range")
+            return d
+    raise ValueError("unrecognised date layout")
 
 
 def open_log(path):
@@ -1267,7 +1392,8 @@ def check_access_logs(rep, args, since_ts):
     samples = defaultdict(list)
     burst = Counter()
     first_ts = last_ts = None
-    lines_total = parsed = 0
+    lines_total = parsed = recognized = 0
+    bad_format = []
 
     def rec(cat, line, ip):
         counts[cat] += 1
@@ -1277,7 +1403,7 @@ def check_access_logs(rep, args, since_ts):
 
     for path in files:
         say("Reading %s ..." % path, 2)
-        l0, p0 = lines_total, parsed
+        l0, p0, r0 = lines_total, parsed, recognized
         try:
             fh = open_log(path)
         except Exception as e:  # noqa
@@ -1287,25 +1413,31 @@ def check_access_logs(rep, args, since_ts):
             try:
                 for line in fh:
                     lines_total += 1
-                    m = ACC_RE.match(line) or ACC_RE_VHOST.match(line)
-                    if not m:
+                    rec_ = None
+                    if line.lstrip().startswith("{"):
+                        rec_ = parse_json_access(line)
+                    else:
+                        m = ACC_RE.match(line) or ACC_RE_VHOST.match(line)
+                        if m:
+                            ts_ = parse_access_ts(m.group("ts"))
+                            if ts_ is not None:
+                                rec_ = (m.group("ip"), ts_, m.group("req"), int(m.group("status")),
+                                        m.group("ua") or "", m.group("ref") or "")
+                    if rec_ is None:
                         continue
-                    ts = parse_access_ts(m.group("ts"))
-                    if ts is None or ts < since_ts:
+                    recognized += 1
+                    ip, ts, req, status, ua, ref = rec_
+                    if ts < since_ts:
                         continue
                     parsed += 1
                     first_ts = ts if first_ts is None else min(first_ts, ts)
                     last_ts = ts if last_ts is None else max(last_ts, ts)
-                    ip = m.group("ip")
-                    req = m.group("req")
-                    status = int(m.group("status"))
-                    ua = m.group("ua") or ""
                     parts = req.split(" ", 2)
                     method = parts[0] if parts else ""
                     target = parts[1] if len(parts) > 1 else ""
                     if POC_RE.search(line):
                         rec("poc", line, ip)
-                    if UP_RE.search(req) or UP_RE.search(m.group("ref") or ""):
+                    if UP_RE.search(req) or UP_RE.search(ref):
                         rec("upload_progress", line, ip)
                     if method == "POST":
                         burst[(ip, int(ts // 60))] += 1
@@ -1319,16 +1451,27 @@ def check_access_logs(rep, args, since_ts):
                         rec("php_in_uploads", line, ip)
             except Exception:
                 continue
-        say("%d lines read, %d inside the time range" % (lines_total - l0, parsed - p0), 3)
+        n_lines, n_rec = lines_total - l0, recognized - r0
+        say("%d lines read, %d in a recognised log format, %d inside the time range" %
+            (n_lines, n_rec, parsed - p0), 3)
+        if n_lines >= 50 and n_rec < 0.5 * n_lines:
+            say("WARNING: most lines of this file could not be parsed (unknown log format?). Findings for it are "
+                "unreliable.", 3)
+            bad_format.append("%s: %d of %d lines recognised" % (path, n_rec, n_lines))
 
     cov = "no matching lines"
     if first_ts:
-        cov = "%s .. %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(first_ts)),
-                            time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts)))
+        cov = "%s .. %s" % (fts(first_ts),
+                            fts(last_ts))
     say("Coverage of the parsed lines: %s. If this starts later than your cutoff, older logs were rotated away "
         "and that period cannot be checked." % cov)
-    rep.add("INFO", sec, "Read %d log files, %d lines (%d parsed in range). Coverage: %s" %
-            (len(files), lines_total, parsed, cov), files[:12])
+    rep.add("INFO", sec, "Read %d log files, %d lines (%d in a recognised format, %d inside the time range). "
+            "Coverage: %s" % (len(files), lines_total, recognized, parsed, cov), files[:12])
+    if bad_format:
+        rep.add("MEDIUM", sec, "Access-log format not recognised in %d file(s): fewer than half of the lines could "
+                "be parsed (supported: combined/common log format with optional vhost, ISO-8601 in brackets, JSON "
+                "lines from Caddy/nginx). A silent miss here means attacks may not be seen; use a standard format "
+                "or inspect these logs manually." % len(bad_format), bad_format)
 
     def top_ips(cat):
         return "top IPs: " + ", ".join("%s(%d)" % kv for kv in ipc[cat].most_common(5))
@@ -1362,7 +1505,7 @@ def check_access_logs(rep, args, since_ts):
     say("Counting POSTs per IP per minute (threshold %d): %d burst(s) found" % (args.burst, len(big)))
     if big:
         big.sort(key=lambda kv: -kv[1])
-        lines = ["%s: %d POSTs in one minute (%s)" % (k[0], v, time.strftime("%Y-%m-%d %H:%M", time.localtime(k[1] * 60)))
+        lines = ["%s: %d POSTs in one minute (%s)" % (k[0], v, fts(k[1] * 60))
                  for k, v in big[:15]]
         rep.add("MEDIUM", sec, "POST bursts >= %d per minute from one IP (brute-force/ASLR guessing or "
                 "scanning)" % args.burst, lines)
@@ -1371,12 +1514,6 @@ def check_access_logs(rep, args, since_ts):
                 "(does not prove the absence of attacks)")
 
 
-ERR_TS = [
-    (re.compile(r"^\[\w{3} (\w{3} +\d+ \d{2}:\d{2}:\d{2})(?:\.\d+)? (\d{4})\]"), "%b %d %H:%M:%S %Y", True),
-    (re.compile(r"^\[(\d{2}-\w{3}-\d{4} \d{2}:\d{2}:\d{2})"), "%d-%b-%Y %H:%M:%S", False),
-    (re.compile(r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})"), "%Y/%m/%d %H:%M:%S", False),
-    (re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})"), "%Y-%m-%d %H:%M:%S", True),
-]
 ERR_PATTERNS = [
     ("oom_unknown", "MEDIUM", re.compile(r"(Allowed memory size of \d+ bytes exhausted|Out of memory).*in Unknown on line 0", re.I)),
     ("fatal_unknown", "MEDIUM", re.compile(r"PHP Fatal error:.*in Unknown on line 0")),
@@ -1397,15 +1534,47 @@ ERR_TITLES = {
 }
 
 
+ERR_APACHE = re.compile(r"^\[\w{3} (\w{3}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? (\d{4})\]")
+ERR_PHP = re.compile(r"^\[(\d{2})-(\w{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2})")
+ERR_NGINX = re.compile(r"^(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})")
+ERR_ISO = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
+ERR_SYSLOG = re.compile(r"^([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ")
+
+
 def err_ts(line):
-    for rx, fmt_, join in ERR_TS:
-        m = rx.match(line)
+    """Timestamp of an error-log / syslog line (epoch) or None. Month names come from a fixed English table, so
+    the host locale is irrelevant. Classic syslog lines carry no year: the most recent past date is assumed."""
+    c = line[:1]
+    if c == "[":
+        m = ERR_APACHE.match(line)
         if m:
-            try:
-                s = " ".join(m.groups()) if join else m.group(1)
-                return time.mktime(dt.datetime.strptime(s, fmt_).timetuple())
-            except Exception:
+            mon, d, H, M, S, y = m.groups()
+            return to_epoch(int(y), MONTHS.get(mon.title(), 0), int(d), int(H), int(M), int(S))
+        m = ERR_PHP.match(line)
+        if m:
+            d, mon, y, H, M, S = m.groups()
+            return to_epoch(int(y), MONTHS.get(mon.title(), 0), int(d), int(H), int(M), int(S))
+        return None
+    if c.isdigit():
+        m = ERR_NGINX.match(line)
+        if m:
+            return to_epoch(*[int(x) for x in m.groups()])
+        m = ERR_ISO.match(line)
+        if m:
+            return parse_access_ts(m.group(1))
+        return None
+    if c.isalpha():
+        m = ERR_SYSLOG.match(line)
+        if m:
+            mon, d, H, M, S = m.groups()
+            mo = MONTHS.get(mon.title())
+            if not mo:
                 return None
+            y = dt.datetime.fromtimestamp(NOW).year
+            ts = to_epoch(y, mo, int(d), int(H), int(M), int(S))
+            if ts is not None and ts > NOW + 86400:
+                ts = to_epoch(y - 1, mo, int(d), int(H), int(M), int(S))
+            return ts
     return None
 
 
@@ -1424,6 +1593,7 @@ def check_error_logs(rep, args, since_ts):
         "kernel segfaults in PHP/web processes, and plain memory/timeout errors (informational) ...")
     counts = Counter()
     samples = defaultdict(list)
+    undated = 0
     for path in files:
         say("Reading %s ..." % path, 2)
         try:
@@ -1433,12 +1603,18 @@ def check_error_logs(rep, args, since_ts):
             continue
         with fh:
             try:
+                last_known = None
                 for line in fh:
+                    ts_line = err_ts(line)
+                    if ts_line is not None:
+                        last_known = ts_line
                     for name, sev, rx in ERR_PATTERNS:
                         if rx.search(line):
-                            ts = err_ts(line)
+                            ts = ts_line if ts_line is not None else last_known
                             if ts is not None and ts < since_ts:
                                 break
+                            if ts is None:
+                                undated += 1
                             counts[name] += 1
                             if len(samples[name]) < 25:
                                 samples[name].append("%s: %s" % (os.path.basename(path), trunc(line.strip(), 240)))
@@ -1447,6 +1623,11 @@ def check_error_logs(rep, args, since_ts):
                 continue
     say("Hit counts: " + ", ".join("%s=%d" % (n, counts[n]) for n, _, _ in ERR_PATTERNS))
     rep.add("INFO", sec, "Read %d error/syslog files" % len(files), files[:12])
+    if undated:
+        say("%d matching line(s) had no parsable date (no earlier dated line in the file either) and were counted "
+            "anyway" % undated)
+        rep.add("LOW", sec, "%d matching error-log line(s) had no parsable date and were counted regardless of "
+                "the cutoff; check them manually" % undated)
     shown = False
     for name, sev, _ in ERR_PATTERNS:
         if counts[name]:
@@ -1524,7 +1705,8 @@ STEP_TEXT = {
 def parse_args():
     ap = argparse.ArgumentParser(description="Local read-only checker for PHP2Shell (CVE-2026-109618 / CVE-2026-109619)")
     ap.add_argument("--since", default=DEFAULT_SINCE,
-                    help="start date YYYY-MM-DD (local time); default %s, the earliest reported attempt" % DEFAULT_SINCE)
+                    help="start of the period: YYYY-MM-DD, 'YYYY-MM-DD HH:MM' or DD.MM.YYYY, in the host's local time "
+                         "(default %s, the earliest reported attempt)" % DEFAULT_SINCE)
     ap.add_argument("--webroot", action="append", default=[], help="extra web root to scan (repeatable)")
     ap.add_argument("--access-log", action="append", default=[], help="extra access log glob (repeatable)")
     ap.add_argument("--error-log", action="append", default=[], help="extra error log glob (repeatable)")
@@ -1546,18 +1728,23 @@ def main():
     args = parse_args()
     QUIET = args.quiet
     try:
-        since = dt.datetime.strptime(args.since, "%Y-%m-%d")
-    except ValueError:
-        print("--since must be YYYY-MM-DD", file=sys.stderr)
+        since = parse_since(args.since)
+        since_ts = time.mktime(since.timetuple())
+    except (ValueError, OverflowError):
+        print("--since: use YYYY-MM-DD, 'YYYY-MM-DD HH:MM' or DD.MM.YYYY. Layouts like 10/22/2026 are refused on "
+              "purpose because the day/month order would be a guess.", file=sys.stderr)
         return 3
-    since_ts = time.mktime(since.timetuple())
+    if since_ts > time.time():
+        print("--since is in the future (%s)" % args.since, file=sys.stderr)
+        return 3
     rep = Report(sys.stdout.isatty() and not args.no_color)
     total = len(STEP_TEXT)
 
     print("php2shell_check v%s (%s) - CVE-2026-109618 / CVE-2026-109619  (read-only, nothing is changed or sent)" %
           (__version__, VERSION_DATE))
     print("host=%s  user=%s  time=%s  checking from=%s" % (socket.gethostname(), uname(os.geteuid()),
-                                                          time.strftime("%Y-%m-%d %H:%M"), args.since))
+                                                          time.strftime("%Y-%m-%d %H:%M"),
+                                                          fts(since_ts) + " (host local time)"))
     if not sys.platform.startswith("linux"):
         print("This checker supports Linux only.", file=sys.stderr)
         return 3
