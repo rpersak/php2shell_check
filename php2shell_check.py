@@ -4,9 +4,15 @@
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
 (CVE-2026-109618 / CVE-2026-109619).
 
-Version 2.2.0 (2026-10-22)
+Version 2.3.0 (2026-10-22)
 
 Changelog
+  2.3.0  2026-10-22  Ideas from php2shell-triage.sh (Laravel/Forge) plus gaps found while comparing: framework
+                     aware scan (PHP where Laravel/Symfony/Drupal/WordPress never keep PHP, any date), git
+                     status against the committed code, deployment noise summarised, log paths taken from
+                     nginx/Apache/php.ini/FPM configs and application logs, 'access_log off' warning, top POST
+                     targets, OOM clusters escalated, SSH login summary, cron spools and all authorized_keys
+                     watched, connections owned by children of web processes, secrets-rotation hint.
   2.2.0  2026-10-22  Date handling hardened: never crashes on forged/huge timestamps (fts), locale-independent
                      month parsing, ISO-8601 and JSON (Caddy/nginx) access logs, syslog lines without a year,
                      continuation lines inherit the previous timestamp, warning when a log format is not
@@ -90,7 +96,7 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 VERSION_DATE = "2026-10-22"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 
@@ -106,6 +112,10 @@ RECON = {"whoami", "id", "hostname", "uname", "nc", "ncat", "netcat", "socat", "
          "wget", "curl", "xxd", "base64", "openssl", "python", "python3", "perl", "ruby", "busybox"}
 RECON_IN_CMD = re.compile(r"(^|[\s;|&/])(whoami|id|hostname|uname|nc|ncat|netcat|socat|xxd|base64|"
                           r"openssl|curl|wget|/dev/tcp|chmod \+x)(\s|;|$)")
+
+APP_ROOTS = []  # filled by step 4, reused by step 7 to find application logs
+STD_PORTS = {20, 21, 22, 25, 53, 80, 110, 123, 143, 389, 443, 465, 587, 636, 853, 993, 995, 1194, 3306, 5432,
+             6379, 9200, 11211, 27017, 51820}
 
 PHPEXT = {".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".php8", ".pht", ".phar", ".phps"}
 IMGEXT = {".jpg", ".jpeg", ".png", ".gif", ".ico", ".webp", ".bmp"}
@@ -220,10 +230,10 @@ class Report(object):
                     print("      ... (+%d more, see --json)" % (len(d) - sample))
 
 
-def run(cmd, timeout=25):
+def run(cmd, timeout=25, env=None):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout, universal_newlines=True)
+                           timeout=timeout, universal_newlines=True, env=env)
         return p.returncode, p.stdout
     except Exception as e:  # noqa
         return 127, str(e)
@@ -825,8 +835,9 @@ def check_processes(rep):
                 "(only a snapshot of right now)")
 
     if shutil.which("ss"):
-        say("Listing established TCP connections with 'ss' and picking outbound ones from web/PHP processes to "
-            "public IPs (attackers use these for reverse shells, downloads and data exfiltration) ...")
+        say("Listing established TCP connections with 'ss' and sorting outbound ones to public IPs into: owned by a "
+            "CHILD of a web/PHP process (reverse shell / download), owned by the web process itself, and other "
+            "processes on unusual ports (attackers use these for reverse shells, downloads and exfiltration) ...")
         rc, lis = run(["ss", "-H", "-tln"])
         listen_ports = set()
         for ln in lis.splitlines():
@@ -834,25 +845,55 @@ def check_processes(rep):
             if len(parts) >= 4:
                 listen_ports.add(parts[3].rsplit(":", 1)[-1])
         rc, out = run(["ss", "-H", "-tnp"])
-        conns = []
+        conns, spawned, unusual = [], [], []
         for ln in out.splitlines():
             parts = ln.split()
             if len(parts) < 6 or parts[0] != "ESTAB":
                 continue
             local, peer, proc = parts[3], parts[4], " ".join(parts[5:])
-            if not re.search(r'"(php|apache2|httpd|nginx|lsphp|frankenphp|caddy)', proc):
-                continue
             lport = local.rsplit(":", 1)[-1]
             if lport in listen_ports:
                 continue
             ip = peer.rsplit(":", 1)[0].strip("[]")
             if re.match(r"^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1|fe80|fd|169\.254\.)", ip):
                 continue
-            conns.append("%s -> %s %s" % (local, peer, trunc(proc, 90)))
-        say("result: %d outbound connection(s) from web/PHP processes to public IPs" % len(conns), 2)
+            from_web = bool(re.search(r'"(php|apache2|httpd|nginx|lsphp|frankenphp|caddy)', proc))
+            child_of_web = False
+            for pid in [int(x) for x in re.findall(r"pid=(\d+)", proc)]:
+                if pid in t and is_web(t[pid]["comm"]):
+                    from_web = True
+                    continue
+                cur, depth = t.get(pid, {}).get("ppid"), 0
+                while cur in t and depth < 8:
+                    if is_web(t[cur]["comm"]):
+                        child_of_web = True
+                        break
+                    cur = t[cur]["ppid"]
+                    depth += 1
+            line = "%s -> %s %s" % (local, peer, trunc(proc, 90))
+            if child_of_web:
+                spawned.append(line)
+            elif from_web:
+                conns.append(line)
+            else:
+                try:
+                    rport = int(peer.rsplit(":", 1)[-1])
+                except ValueError:
+                    rport = 0
+                if rport not in STD_PORTS:
+                    unusual.append(line)
+        say("result: %d connection(s) owned by a child of a web/PHP process, %d outbound from web/PHP processes "
+            "to public IPs, %d from other processes to public IPs on unusual ports" %
+            (len(spawned), len(conns), len(unusual)), 2)
+        if spawned:
+            rep.add("HIGH", sec, "Network connection owned by a process STARTED BY a web/PHP process (typical "
+                    "reverse shell, payload download or exfiltration)", spawned)
         if conns:
             rep.add("LOW", sec, "Outbound connections from web/PHP processes to public IPs "
                     "(often legitimate API calls; review unknown peers)", conns)
+        if unusual:
+            rep.add("LOW", sec, "Outbound connections from other processes to public IPs on unusual ports "
+                    "(monitoring agents, VPNs and databases are common; review unknown peers)", unusual)
     else:
         say("'ss' is not installed, skipping the connection check.")
     return web_users
@@ -897,6 +938,64 @@ def scan_content(data, patterns):
     return hits
 
 
+def find_app_root(root):
+    """Walk up (max 3 levels) from a web root to the project root of a known framework.
+    Returns (app_root, framework) or (None, None). Handles docroots like <app>/current/public."""
+    cur = root
+    for _ in range(4):
+        for rel, fw in (("artisan", "laravel"), ("bin/console", "symfony"), ("core/lib/Drupal.php", "drupal"),
+                        ("wp-config.php", "wordpress"), ("wp-includes/version.php", "wordpress")):
+            if os.path.isfile(os.path.join(cur, rel)):
+                if fw == "symfony" and not os.path.isfile(os.path.join(cur, "public", "index.php")):
+                    continue
+                return cur, fw
+        parent = os.path.dirname(cur)
+        if parent == cur or parent in ("/", "/var", "/home", "/srv", "/opt", "/usr", "/etc"):
+            break
+        cur = parent
+    return None, None
+
+
+def in_no_php_zone(fw, rel):
+    """True if a PHP file at this path (relative to the project root) does not belong there for the framework."""
+    r = rel.replace(os.sep, "/")
+    if r.startswith("./"):
+        r = r[2:]
+    if fw == "laravel":
+        if r.startswith("public/"):
+            return r != "public/index.php"
+        if r.startswith("storage/"):
+            return not (r.startswith("storage/framework/views/") or r == "storage/framework/maintenance.php")
+    elif fw == "symfony":
+        return r.startswith("public/") and r != "public/index.php"
+    elif fw == "drupal":
+        return bool(re.match(r"^sites/[^/]+/files/", r)) and "/files/php/" not in r
+    elif fw == "wordpress":
+        return r.startswith("wp-content/uploads/")
+    return False
+
+
+ZONE_TEXT = {"laravel": "public/ (except index.php) and storage/ (except compiled views)",
+             "symfony": "public/ (except index.php)", "drupal": "sites/*/files/ (except compiled templates)",
+             "wordpress": "wp-content/uploads/"}
+
+
+def git_dirty(path):
+    """Read-only 'git status'. GIT_OPTIONAL_LOCKS=0 stops git from refreshing (writing) the index."""
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    rc, out = run(["git", "-c", "safe.directory=*", "-C", path, "status", "--porcelain",
+                   "--untracked-files=normal"], timeout=45, env=env)
+    if rc != 0:
+        return None, out.strip().splitlines()[:1]
+    keep = []
+    for ln in out.splitlines():
+        f = ln[3:].strip().strip('"')
+        if re.search(r"(^|/)\.env($|\.)|(^|/)storage/|(^|/)bootstrap/cache/|(^|/)node_modules/", f):
+            continue
+        keep.append(ln.rstrip())
+    return keep, []
+
+
 def check_files(rep, args, since_ts, web_users):
     sec = "4. Files"
     say("Discovering web roots: common paths (/var/www, /srv, /home/*/public_html, ...) plus 'root' and "
@@ -906,6 +1005,21 @@ def check_files(rep, args, since_ts, web_users):
                                     if roots else ""))
     if not roots:
         rep.add("LOW", sec, "No web roots found; pass --webroot /path to scan one")
+    say("Looking for framework project roots (Laravel artisan, Symfony bin/console, Drupal, WordPress) at or up "
+        "to 3 levels above each web root, so that e.g. <app>/current/public is scanned together with storage/ ...")
+    scan_roots, fw_of = [], {}
+    for r in roots:
+        app, fw = find_app_root(r)
+        target = app if app and (r == app or r.startswith(app.rstrip("/") + "/")) else r
+        if target not in scan_roots:
+            scan_roots.append(target)
+            fw_of[target] = fw
+    scan_roots = [r for r in scan_roots if not any(r != o and r.startswith(o.rstrip("/") + "/") for o in scan_roots)]
+    APP_ROOTS[:] = scan_roots
+    for r in scan_roots:
+        if fw_of.get(r):
+            say("%s is a %s application: PHP files in %s are flagged at ANY date (the framework never keeps "
+                "PHP there)" % (r, fw_of[r], ZONE_TEXT[fw_of[r]]), 2)
     say("Walking every file (symlinks are not followed, max %d files). For each file changed since the cutoff "
         "(or sitting in an upload/cache-like folder) the content is scanned for:" % args.max_files)
     say("PHP code with eval(base64_decode(..)), system($_POST[..]), assert($_GET[..]), preg_replace /e, known "
@@ -913,11 +1027,13 @@ def check_files(rep, args, since_ts, web_users):
     say(".htaccess / .user.ini with auto_prepend_file, AddType php, or php_value overrides", 2)
     say("images (jpg/png/gif/...) that actually contain '<?php'", 2)
     say("recently changed executable files and any PHP file inside an uploads/cache/tmp/media-like folder", 2)
+    say("PHP files in framework directories that never hold PHP (checked regardless of date)", 2)
     finds = defaultdict(list)
     scanned = 0
     recent_code = 0
     limit_hit = False
-    for root in roots:
+    for root in scan_roots:
+        fw = fw_of.get(root)
         say("Scanning %s ..." % root, 2)
         before = scanned
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -948,12 +1064,16 @@ def check_files(rep, args, since_ts, web_users):
                 if ext in PHPEXT:
                     if recent:
                         recent_code += 1
-                    if recent or in_upload:
+                    zone = bool(fw) and in_no_php_zone(fw, rel)
+                    if recent or in_upload or zone:
                         data = read_bytes(path, 2000000)
                         hits = scan_content(data, WEBSHELL_PATTERNS)
                         for sev, label in hits:
                             finds[sev].append("%s [%s] %s" % (path, stamp, label))
-                        if not hits and in_upload and recent:
+                        if not hits and zone:
+                            finds["MEDIUM"].append("%s [%s] PHP file where a %s application never keeps PHP "
+                                                   "(any date; verify it is intentional)" % (path, stamp, fw))
+                        elif not hits and in_upload and recent:
                             finds["MEDIUM"].append("%s [%s] PHP file in upload/cache-like directory" % (path, stamp))
                         elif not hits and recent:
                             finds["LOW"].append("%s [%s] recently changed code file" % (path, stamp))
@@ -981,10 +1101,48 @@ def check_files(rep, args, since_ts, web_users):
               "MEDIUM": "Suspicious files in web roots",
               "LOW": "Recently changed code files (legitimate updates and deployments are listed too)"}
     for sev in ("HIGH", "MEDIUM", "LOW"):
-        if finds[sev]:
-            rep.add(sev, sec, "%s: %d finding(s)" % (titles[sev], len(finds[sev])), finds[sev])
-    rep.add("INFO", sec, "Scanned %d files in %d web root(s): %s; %d code files changed since the cutoff" %
-            (scanned, len(roots), ", ".join(roots[:6]) + (" ..." if len(roots) > 6 else ""), recent_code))
+        if not finds[sev]:
+            continue
+        if sev == "LOW" and len(finds[sev]) > 25:
+            say("%d recently changed code files without any suspicious content: this looks like a deployment or "
+                "update, so they are summarised instead of listed" % len(finds[sev]))
+            rep.add("INFO", sec, "%d code files changed since the cutoff (looks like a deployment/update; their "
+                    "content was scanned and nothing matched). First 10:" % len(finds[sev]), finds[sev][:10])
+            continue
+        rep.add(sev, sec, "%s: %d finding(s)" % (titles[sev], len(finds[sev])), finds[sev])
+    rep.add("INFO", sec, "Scanned %d files in %d project/web root(s): %s; %d code files changed since the cutoff" %
+            (scanned, len(scan_roots), ", ".join(scan_roots[:6]) + (" ..." if len(scan_roots) > 6 else ""),
+             recent_code))
+
+    if shutil.which("git"):
+        say("Checking git checkouts: 'git status' (read-only, no index refresh) shows tracked files modified and "
+            "untracked files compared with the committed code - the cleanest proof that code was altered ...")
+        for r in scan_roots:
+            top = r
+            for _ in range(4):
+                if os.path.isdir(os.path.join(top, ".git")):
+                    break
+                top = os.path.dirname(top)
+            else:
+                continue
+            if top in ("/", ""):
+                continue
+            dirty, err = git_dirty(top)
+            if dirty is None:
+                say("git status failed in %s: %s" % (top, " ".join(err) or "unknown error"), 2)
+                rep.add("LOW", sec, "git status could not be run in %s: %s" % (top, " ".join(err) or "unknown error"))
+                continue
+            say("%s: %d difference(s) from the committed code (ignoring .env, storage, caches)" % (top, len(dirty)), 2)
+            codey = [l for l in dirty if re.search(r"\.(php\d?|phtml|phar|pht)$|(^|/)public/|\.htaccess$", l, re.I)]
+            other = [l for l in dirty if l not in codey]
+            if codey:
+                rep.add("MEDIUM", sec, "Git checkout %s: %d PHP/public file(s) modified or untracked compared with "
+                        "the repository (review each; '??' = untracked, 'M' = modified)" % (top, len(codey)), codey)
+            if other:
+                rep.add("LOW", sec, "Git checkout %s: %d other difference(s) from the repository" % (top, len(other)),
+                        other)
+            if not dirty:
+                rep.add("INFO", sec, "Git checkout %s: working tree identical to the repository" % top)
 
     say("Scanning /tmp, /var/tmp, /dev/shm (3 levels deep) for files changed since the cutoff that are owned by "
         "a web user, executable, hidden, or ELF binaries - where attackers drop tools ...")
@@ -1153,6 +1311,64 @@ def check_shell_history(rep, sec, web_users, since_ts):
                 "appear in history, so this is weak evidence" % files_seen)
 
 
+SSH_ACCEPT_RE = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port \d+")
+
+
+def check_ssh_logins(rep, sec, web_set, since_ts):
+    say("Listing successful SSH logins since the cutoff (/var/log/auth.log*, /var/log/secure*, else journalctl) "
+        "grouped by user, source address and method - a login you do not recognise, any login of a web account, "
+        "or a root password login is a stronger sign of access than any web log ...")
+    lines, src = [], ""
+    files = [f for f in uniq_real(glob.glob("/var/log/auth.log*") + glob.glob("/var/log/secure*"))
+             if os.path.getmtime(f) >= since_ts]
+    if files:
+        src = ", ".join(files[:4])
+        for f in files:
+            try:
+                with open_log(f) as fh:
+                    lines.extend(l for l in fh if "Accepted " in l)
+            except Exception:
+                continue
+    elif shutil.which("journalctl"):
+        src = "journalctl"
+        rc, out = run(["journalctl", "-q", "--no-pager", "-o", "short-iso", "-t", "sshd", "-t", "sshd-session",
+                       "--since", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since_ts))], timeout=90)
+        if rc == 0:
+            lines = [l for l in out.splitlines() if "Accepted " in l]
+    if not src:
+        say("no readable SSH log found (run as root, or logs are elsewhere); skipping", 2)
+        rep.add("LOW", sec, "SSH login history could not be read (no auth.log/secure/journal access)")
+        return
+    agg = {}
+    for l in lines:
+        m = SSH_ACCEPT_RE.search(l)
+        if not m:
+            continue
+        ts = err_ts(l)
+        if ts is None or ts < since_ts:
+            continue
+        method, user, ip = m.groups()
+        a = agg.setdefault((user, ip, method), [0, ts, ts])
+        a[0] += 1
+        a[1], a[2] = min(a[1], ts), max(a[2], ts)
+    say("source: %s; %d distinct (user, source, method) combination(s) since the cutoff" % (src, len(agg)), 2)
+    web = {u for u in web_set}
+    rows = sorted(agg.items(), key=lambda kv: -kv[1][2])
+    fmt_row = lambda kv: "%s from %s via %s: %dx, %s .. %s" % (kv[0][0], kv[0][1], kv[0][2], kv[1][0],
+                                                              fts(kv[1][1]), fts(kv[1][2]))
+    bad = [fmt_row(kv) for kv in rows if kv[0][0] in web]
+    if bad:
+        rep.add("HIGH", sec, "SSH login as a web/PHP service account (these accounts should never log in)", bad)
+    rootpw = [fmt_row(kv) for kv in rows if kv[0][0] == "root" and kv[0][2] in ("password", "keyboard-interactive/pam")]
+    if rootpw:
+        rep.add("MEDIUM", sec, "Root logged in over SSH with a password", rootpw)
+    if rows:
+        rep.add("INFO", sec, "Successful SSH logins since the cutoff: %d distinct (user, source, method); check "
+                "that every source address is expected" % len(rows), [fmt_row(kv) for kv in rows[:25]])
+    else:
+        rep.add("INFO", sec, "No successful SSH logins found in %s since the cutoff" % src)
+
+
 def check_persistence(rep, since_ts, web_users, pool_users):
     sec = "5. Persistence and system changes"
     users = set(web_users) | set(pool_users) | {"www-data", "apache", "nginx", "wwwrun", "www", "httpd"}
@@ -1201,13 +1417,18 @@ def check_persistence(rep, since_ts, web_users, pool_users):
 
     check_shell_history(rep, sec, users, since_ts)
 
-    say("Checking whether sensitive system files changed since the cutoff (passwd, shadow, sudoers, cron, "
+    check_ssh_logins(rep, sec, users, since_ts)
+
+    say("Checking whether sensitive system files changed since the cutoff (also cron spools and every user's "
+        "authorized_keys; passwd, shadow, sudoers, cron, "
         "systemd units, rc.local, profile.d, init.d, sshd_config, root authorized_keys) ...")
     watch = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/crontab", "/etc/rc.local",
              "/root/.ssh/authorized_keys", "/etc/ssh/sshd_config", "/etc/environment"]
     for pat in ("/etc/sudoers.d/*", "/etc/cron.d/*", "/etc/cron.hourly/*", "/etc/cron.daily/*",
                 "/etc/cron.weekly/*", "/etc/profile.d/*", "/etc/systemd/system/*.service",
-                "/etc/systemd/system/*.timer", "/etc/systemd/system/*/*.service", "/etc/init.d/*"):
+                "/etc/systemd/system/*.timer", "/etc/systemd/system/*/*.service", "/etc/init.d/*",
+                "/var/spool/cron/crontabs/*", "/var/spool/cron/*", "/home/*/.ssh/authorized_keys",
+                "/home/*/.ssh/authorized_keys2", "/root/.ssh/authorized_keys2"):
         watch.extend(glob.glob(pat))
     changed = []
     for f in sorted(set(watch)):
@@ -1338,6 +1559,75 @@ def parse_since(text):
     raise ValueError("unrecognised date layout")
 
 
+CFG_LOG_RES = (
+    ("access", re.compile(r"(?:^|[;{}])\s*access_log\s+(/[^\s;]+)")),
+    ("error", re.compile(r"(?:^|[;{}])\s*error_log\s+(/[^\s;]+)")),
+    ("access", re.compile(r'^\s*CustomLog\s+"?((?:/|\$\{APACHE_LOG_DIR\})[^\s"]+)"?\s')),
+    ("error", re.compile(r'^\s*ErrorLog\s+"?((?:/|\$\{APACHE_LOG_DIR\})[^\s"]+)"?')),
+)
+ACCESS_OFF_RE = re.compile(r"(?:^|[;{}])\s*access_log\s+off\s*;")
+
+
+@functools.lru_cache(maxsize=1)
+def config_logs():
+    """Log paths declared in nginx/Apache configs: (access_paths, error_paths, configs_with_access_log_off).
+    Variables ($host, ${APACHE_LOG_DIR}) are turned into globs so per-site log files are found too."""
+    access, error, off = set(), set(), set()
+    files = []
+    for pat in ("/etc/nginx/**/*", "/etc/apache2/**/*", "/etc/httpd/**/*", "/usr/local/nginx/conf/**/*",
+                "/usr/local/apache2/conf/**/*"):
+        files.extend(glob.glob(pat, recursive=True))
+    for f in files:
+        try:
+            if not os.path.isfile(f) or os.path.getsize(f) > 1000000:
+                continue
+        except Exception:
+            continue
+        for line in read_text(f).splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            if ACCESS_OFF_RE.search(line):
+                off.add(f)
+            for kind, rx in CFG_LOG_RES:
+                m = rx.search(line)
+                if not m:
+                    continue
+                path = m.group(1).replace("${APACHE_LOG_DIR}", "/var/log/apache2")
+                path = re.sub(r"\$\{?\w+\}?", "*", path)
+                if path.startswith("/dev/") or "|" in path:
+                    continue
+                (access if kind == "access" else error).add(path)
+    return sorted(access), sorted(error), sorted(off)
+
+
+def expand_paths(paths):
+    """A configured log path also covers its rotated siblings (.1, .2.gz, -20261020)."""
+    out = []
+    for p in paths:
+        out.extend([p, p + ".*", p + "-*"])
+    return out
+
+
+def php_error_logs():
+    found = set()
+    for label, files, pool_files in ini_families():
+        for f in files + pool_files:
+            for line in read_text(f).splitlines():
+                m = re.match(r'^\s*(?:php_(?:admin_)?value\[error_log\]|error_log)\s*=\s*"?(/[^\s";]+)', line)
+                if m and not m.group(1).startswith("/dev/"):
+                    found.add(m.group(1))
+    return sorted(found)
+
+
+def app_log_globs(args):
+    roots = list(APP_ROOTS) or discover_webroots(args.webroot)
+    out = []
+    for r in roots:
+        for rel in ("storage/logs/*.log*", "var/log/*.log*", "wp-content/debug.log*"):
+            out.append(os.path.join(r, rel))
+    return out
+
+
 def open_log(path):
     if path.endswith(".gz"):
         return gzip.open(path, "rt", errors="replace")
@@ -1371,7 +1661,15 @@ def check_access_logs(rep, args, since_ts):
     sec = "6. Logs: access"
     say("Collecting access logs (nginx, Apache, lighttpd, Caddy, LiteSpeed, Plesk paths + your --access-log "
         "globs). Rotated .gz files are read too; files last written before the cutoff are skipped ...")
-    files = log_files(ACCESS_GLOBS + args.access_log, since_ts)
+    cfg_access, cfg_error, access_off = config_logs()
+    say("Also found %d access-log path(s) declared in the nginx/Apache configs (access_log, CustomLog), "
+        "including rotated siblings" % len(cfg_access))
+    if access_off:
+        say("WARNING: 'access_log off' is set in %d nginx config file(s): no request log exists for those sites" %
+            len(access_off))
+        rep.add("LOW", sec, "access_log is switched off in %d nginx config file(s): no request log exists for "
+                "those sites, so log analysis is blind there" % len(access_off), access_off)
+    files = log_files(ACCESS_GLOBS + args.access_log + expand_paths(cfg_access), since_ts)
     say("%d access log file(s) selected%s" % (len(files), ": " + ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
                                               if files else ""))
     if not files:
@@ -1391,6 +1689,7 @@ def check_access_logs(rep, args, since_ts):
     ipc = defaultdict(Counter)
     samples = defaultdict(list)
     burst = Counter()
+    post_targets = Counter()
     first_ts = last_ts = None
     lines_total = parsed = recognized = 0
     bad_format = []
@@ -1441,6 +1740,9 @@ def check_access_logs(rep, args, since_ts):
                         rec("upload_progress", line, ip)
                     if method == "POST":
                         burst[(ip, int(ts // 60))] += 1
+                        pt = target.split("?")[0][:120]
+                        if pt in post_targets or len(post_targets) < 50000:
+                            post_targets[pt] += 1
                         if status >= 500:
                             rec("post500", line, ip)
                         if ua in ("", "-") or len(ua) < 3:
@@ -1472,6 +1774,10 @@ def check_access_logs(rep, args, since_ts):
                 "be parsed (supported: combined/common log format with optional vhost, ISO-8601 in brackets, JSON "
                 "lines from Caddy/nginx). A silent miss here means attacks may not be seen; use a standard format "
                 "or inspect these logs manually." % len(bad_format), bad_format)
+    if post_targets:
+        say("Top POST targets in the period: " + ", ".join("%s(%d)" % (p, c) for p, c in post_targets.most_common(5)))
+        rep.add("INFO", sec, "Top POST targets in the period (look for endpoints that never take forms or uploads)",
+                ["%6d  %s" % (c, p) for p, c in post_targets.most_common(15)])
 
     def top_ips(cat):
         return "top IPs: " + ", ".join("%s(%d)" % kv for kv in ipc[cat].most_common(5))
@@ -1536,6 +1842,7 @@ ERR_TITLES = {
 
 ERR_APACHE = re.compile(r"^\[\w{3} (\w{3}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? (\d{4})\]")
 ERR_PHP = re.compile(r"^\[(\d{2})-(\w{3})-(\d{4}) (\d{2}):(\d{2}):(\d{2})")
+ERR_BRACKET_ISO = re.compile(r"^\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 ERR_NGINX = re.compile(r"^(\d{4})/(\d{2})/(\d{2}) (\d{2}):(\d{2}):(\d{2})")
 ERR_ISO = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
 ERR_SYSLOG = re.compile(r"^([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ")
@@ -1554,6 +1861,9 @@ def err_ts(line):
         if m:
             d, mon, y, H, M, S = m.groups()
             return to_epoch(int(y), MONTHS.get(mon.title(), 0), int(d), int(H), int(M), int(S))
+        m = ERR_BRACKET_ISO.match(line)
+        if m:
+            return to_epoch(*[int(x) for x in m.groups()])
         return None
     if c.isdigit():
         m = ERR_NGINX.match(line)
@@ -1582,7 +1892,13 @@ def check_error_logs(rep, args, since_ts):
     sec = "7. Logs: error / syslog"
     say("Collecting PHP, FPM, Apache and nginx error logs plus syslog/messages/kern.log (+ your --error-log "
         "globs) that were written since the cutoff ...")
-    files = log_files(ERROR_GLOBS + args.error_log, since_ts)
+    cfg_access, cfg_error, access_off = config_logs()
+    php_logs = php_error_logs()
+    app_logs = app_log_globs(args)
+    say("Additional sources: %d error-log path(s) from nginx/Apache configs, %d from php.ini/FPM pools, plus "
+        "application logs (Laravel storage/logs, Symfony var/log, WordPress debug.log) under the project roots" %
+        (len(cfg_error), len(php_logs)))
+    files = log_files(ERROR_GLOBS + args.error_log + expand_paths(cfg_error + php_logs) + app_logs, since_ts)
     say("%d error/syslog file(s) selected%s" % (len(files), ": " + ", ".join(files[:6]) + (" ..." if len(files) > 6 else "")
                                                 if files else ""))
     if not files:
@@ -1594,6 +1910,7 @@ def check_error_logs(rep, args, since_ts):
     counts = Counter()
     samples = defaultdict(list)
     undated = 0
+    oom_days = Counter()
     for path in files:
         say("Reading %s ..." % path, 2)
         try:
@@ -1616,6 +1933,8 @@ def check_error_logs(rep, args, since_ts):
                             if ts is None:
                                 undated += 1
                             counts[name] += 1
+                            if name == "oom":
+                                oom_days[fts(ts)[:10] if ts is not None else "unknown date"] += 1
                             if len(samples[name]) < 25:
                                 samples[name].append("%s: %s" % (os.path.basename(path), trunc(line.strip(), 240)))
                             break
@@ -1635,7 +1954,14 @@ def check_error_logs(rep, args, since_ts):
             s = sev
             if name == "child_signal" and counts[name] < 3:
                 s = "LOW"
-            rep.add(s, sec, "%s: %d" % (ERR_TITLES[name], counts[name]), samples[name])
+            det, title = list(samples[name]), "%s: %d" % (ERR_TITLES[name], counts[name])
+            if name == "oom":
+                det.insert(0, "per day: " + ", ".join("%s=%d" % kv for kv in sorted(oom_days.items())))
+                if counts[name] >= 4:
+                    s = "MEDIUM"
+                    title += (" - a cluster of 4 or more; fatal memory errors are listed as a sign of exploitation "
+                              "attempts in the URSIV order (point V), especially on multipart requests")
+            rep.add(s, sec, title, det)
     if not shown:
         rep.add("INFO", sec, "No matching error-log patterns in range")
 
@@ -1662,43 +1988,57 @@ STEP_TEXT = {
         "(MEDIUM when PHP is vulnerable, otherwise low/info)."),
     3: ("Running processes and network connections",
         "Reads /proc: finds PHP workers still running a replaced binary, shells/recon tools started below a "
-        "web or PHP process, and outbound TCP connections from web processes to public IPs.",
+        "web or PHP process, and established TCP connections: those owned by a child of a web process, by the "
+        "web process itself, and by other processes to public IPs on unusual ports.",
         "Patching without restarting leaves the vulnerable code in memory, and a successful exploit usually "
-        "shows up as a web worker spawning a shell or calling out to the internet.",
-        "stale worker (HIGH); shell with recon commands or whoami/id/nc under a web process (HIGH); plain "
-        "shell (MEDIUM); outbound connection to a public IP (LOW, review the peer)."),
+        "shows up as a web worker spawning a shell that opens a connection to the internet (any port, "
+        "including 443).",
+        "stale worker (HIGH); shell with recon commands or whoami/id/nc under a web process (HIGH); a "
+        "connection owned by a child of a web process (HIGH); plain shell (MEDIUM); outbound connections from "
+        "web processes or on unusual ports (LOW, review the peer)."),
     4: ("Web root files, webshells and temp directories",
-        "Walks all web roots and scans files changed since the cutoff (and everything in upload/cache-like "
-        "folders) for webshell code, hidden PHP in images, malicious .htaccess/.user.ini, then inspects "
-        "/tmp, /var/tmp and /dev/shm for dropped tools.",
+        "Finds web roots (and the framework project root above them), scans files changed since the cutoff "
+        "and everything in upload/cache-like folders for webshell code, hidden PHP in images and malicious "
+        ".htaccess/.user.ini; flags PHP in directories where Laravel/Symfony/Drupal/WordPress never keep PHP "
+        "at ANY date; compares git checkouts with the committed code; then inspects /tmp, /var/tmp and "
+        "/dev/shm for dropped tools.",
         "Updating PHP does not remove a webshell that was planted earlier. File evidence is stronger proof of "
-        "compromise than any log line.",
+        "compromise than any log line, and a git diff is the cleanest truth for deployed code.",
         "eval(base64_decode()), system($_POST[]) and similar (HIGH); PHP inside images (HIGH); "
-        "auto_prepend_file (HIGH); PHP in upload folders or new executables (MEDIUM); ELF files owned by the "
-        "web user in /tmp (HIGH)."),
+        "auto_prepend_file (HIGH); PHP in upload or no-PHP framework folders, files with a future "
+        "modification time, git differences in PHP/public files, new executables (MEDIUM); ELF files owned "
+        "by the web user in /tmp (HIGH). Long lists of changed files after a deployment are summarised."),
     5: ("Persistence and system changes",
         "Checks crontabs, SSH keys and login shells of web accounts, /etc/ld.so.preload, extra UID 0 accounts, "
-        "shell history files (bash/zsh) of all accounts for reverse shells, download-and-run, history tampering "
-        "and PoC markers, and whether passwd, shadow, sudoers, cron, systemd units and similar files changed "
-        "since the cutoff.",
-        "After code execution attackers typically add a way back in. Web accounts normally have none of these.",
-        "ld.so.preload content or a second UID 0 account (HIGH); web user with crontab/authorized_keys or a "
-        "changed system file (MEDIUM - package updates also change files, so verify)."),
+        "shell history files (bash/zsh) of all accounts, successful SSH logins since the cutoff (grouped by "
+        "user, source and method), and whether passwd, shadow, sudoers, cron (incl. spools), systemd units, "
+        "every user's authorized_keys and similar files changed since the cutoff.",
+        "After code execution attackers typically add a way back in or log in with stolen credentials. Web "
+        "accounts normally have none of these.",
+        "ld.so.preload content, a second UID 0 account, suspicious commands in a web account's history or an "
+        "SSH login as a web account (HIGH); web user with crontab/authorized_keys/history file, root password "
+        "login, risky commands or tampering in other histories, or a changed system file (MEDIUM - package "
+        "updates also change files, so verify). All SSH sources are listed as INFO for you to recognise."),
     6: ("Access logs",
-        "Parses nginx/Apache access logs (including rotated .gz) from the cutoff date onward and counts PoC "
-        "markers, upload_progress in URLs, POST 5xx, empty User-Agent POSTs, PHPSESSID in URLs, requests to "
-        "PHP files in upload folders and POST bursts per IP.",
+        "Parses nginx/Apache/Caddy access logs (combined, ISO-8601 and JSON formats, including rotated .gz) "
+        "from the cutoff onward - found through standard paths AND the access_log/CustomLog directives in the "
+        "web server configs - and counts PoC markers, upload_progress in URLs, POST 5xx, empty User-Agent "
+        "POSTs, PHPSESSID in URLs, requests to PHP files in upload folders, POST bursts per IP and the top POST "
+        "targets. Warns where 'access_log off' leaves no logs at all.",
         "Shows who is probing or attacking and from where. The earliest reported attempt was 17 October, so "
         "that is the default cutoff.",
         "PoC markers (HIGH); upload_progress, PHP-in-uploads, POST 5xx from one IP >= 10, POST bursts "
-        "(MEDIUM); other patterns (LOW). A hit is an attempt, not a compromise."),
+        "(MEDIUM); other patterns, disabled logging (LOW). A hit is an attempt, not a compromise."),
     7: ("Error logs and syslog",
-        "Searches PHP/FPM/Apache/nginx error logs and syslog for memory exhaustion 'in Unknown on line 0', "
-        "fatal errors outside any script, worker crashes and kernel segfaults in PHP or web processes.",
+        "Searches PHP/FPM/Apache/nginx error logs, syslog and application logs (Laravel storage/logs, Symfony "
+        "var/log, WordPress debug.log; log paths also come from the web server and php.ini/FPM configs) for "
+        "memory exhaustion, 'in Unknown on line 0' fatals, worker crashes and kernel segfaults in PHP or web "
+        "processes.",
         "The exploits work by driving PHP into memory errors and crashes, which are logged even when the "
-        "request body is not.",
-        "'in Unknown on line 0' errors and repeated crashes/segfaults (MEDIUM); ordinary memory or timeout "
-        "errors (LOW)."),
+        "request body is not. The URSIV order names fatal memory errors (especially on multipart requests) "
+        "and worker crashes as signs to look for.",
+        "'in Unknown on line 0' errors, repeated crashes/segfaults and clusters of 4 or more memory "
+        "exhaustion errors (MEDIUM); isolated memory or timeout errors (LOW)."),
 }
 
 
@@ -1817,6 +2157,8 @@ def main():
     print("Updating PHP (8.5.12 / 8.4.27 / 8.3.36 / 8.2.35) and restarting all workers is the only complete fix.")
     print("No findings does NOT prove the host was not attacked: access logs have no request bodies, and memory\n"
           "disclosure or file reads leave no files. If the host was exposed, rotate secrets PHP could read.")
+    print("Rotate what the web user could read: framework keys (Laravel APP_KEY, WordPress salts, Symfony "
+          "APP_SECRET), database/API/SMTP\ncredentials, session secrets, TLS private keys and deploy/SSH keys.")
     if args.json:
         try:
             with open(args.json, "w") as f:

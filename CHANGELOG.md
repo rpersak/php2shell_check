@@ -2,6 +2,24 @@
 
 All notable changes to `php2shell_check.py`. The format follows [Keep a Changelog](https://keepachangelog.com/); versions follow semantic versioning, where the command-line options and the report format are the public interface.
 
+## [2.3.0] - 2026-10-22
+
+### Added
+- Framework-aware scan: PHP files where Laravel, Symfony, Drupal or WordPress never keep PHP (Laravel `public/` except `index.php` and `storage/` except compiled views, Symfony `public/`, Drupal `sites/*/files/`, WordPress `wp-content/uploads/`) are flagged at ANY date. The project root is detected up to 3 levels above the web root, so `<app>/current/public` docroots work.
+- `git status` (read-only, `GIT_OPTIONAL_LOCKS=0`) against the committed code for git checkouts: modified and untracked PHP/public files are reported.
+- Log paths are taken from the nginx/Apache configs (`access_log`, `error_log`, `CustomLog`, `ErrorLog`) and from php.ini / FPM pools, including rotated siblings; application logs (Laravel `storage/logs`, Symfony `var/log`, WordPress `debug.log`) are read too.
+- Warning when `access_log off` is configured (no request log exists for that site).
+- Top POST targets in the period (INFO) to spot endpoints that never take forms or uploads.
+- Clusters of 4 or more memory-exhaustion errors escalate to MEDIUM, with a per-day breakdown (URSIV order, point V).
+- Successful SSH logins since the cutoff, grouped by user, source and method: a web/PHP service account login is HIGH, a root password login is MEDIUM.
+- Cron spools and every user's `authorized_keys` are part of the changed-files watch list.
+- Network connections owned by a child of a web/PHP process are HIGH; outbound connections from other processes to public IPs on unusual ports are LOW.
+- Secrets-rotation hint in the final summary.
+
+### Changed
+- More than 25 changed code files without any suspicious content (typical after a deployment) are summarised in one INFO line instead of listed.
+- Step descriptions updated for the new checks.
+
 ## [2.2.0] - 2026-10-22
 
 ### Added
