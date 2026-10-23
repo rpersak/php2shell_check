@@ -2,7 +2,8 @@
 
 All-in-one, **read-only** local checker for the PHP vulnerabilities known as *PHP2Shell*
 (CVE-2026-109618 / CVE-2026-109619, unauthenticated remote code execution, fixed in PHP
-8.5.12, 8.4.27, 8.3.36 and 8.2.35, released 21 October 2026).
+8.5.12, 8.4.27, 8.3.36 and 8.2.35, released 21 October 2026), plus the related session upload progress issue
+**CVE-2026-115560** (PHP informational advisory of 23 October 2026, no fixed release yet).
 
 One Python file, standard library only, Python 3.6+, Linux. It changes nothing and sends nothing
 over the network. While it runs it explains in English what each step does and what it looks for,
@@ -41,9 +42,9 @@ The script prints this scope and what it detected on the host at the start of ev
 |---|---|
 | 0 | Environment: OS, package manager, container, hosting panels |
 | 1 | PHP versions of every binary and `mod_php` module against the fixed releases; the distro package changelog is searched for the two CVE ids (distros backport without changing the version number) |
-| 2 | Interim mitigations: `session.upload_progress.enabled`, `memory_limit=-1` enforced with `php_admin_value`, `pm.max_requests`, `post_max_size`, `fatal_error_backtraces` |
+| 2 | Interim mitigations: `session.upload_progress.enabled`, `memory_limit=-1` enforced with `php_admin_value`, `pm.max_requests`, `post_max_size`, `fatal_error_backtraces`; `session.serialize_handler` per pool (CVE-2026-115560) |
 | 3 | Processes and connections: workers still running a replaced binary, shells/recon tools below a web process, connections owned by a child of a web process, outbound connections |
-| 4 | Files: webshell patterns, PHP hidden in images, malicious `.htaccess`/`.user.ini`, PHP where Laravel/Symfony/Drupal/WordPress never keep PHP, `git status` against the committed code, dropped tools in `/tmp`, `/var/tmp`, `/dev/shm` |
+| 4 | Files: webshell patterns, PHP hidden in images, malicious `.htaccess`/`.user.ini`, PHP where Laravel/Symfony/Drupal/WordPress never keep PHP, `git status` against the committed code, every PHP file searched for `ini_set('session.serialize_handler', ...)` and a combined CVE-2026-115560 verdict, dropped tools in `/tmp`, `/var/tmp`, `/dev/shm` |
 | 5 | Persistence: web-account cron/keys/shell, `ld.so.preload`, extra UID 0, shell history of all accounts, SSH logins since the cutoff, changed system files |
 | 6 | Access logs (combined, ISO-8601, JSON; `.gz`): PoC markers, `upload_progress`, POST 5xx, empty User-Agent, POST bursts, top POST targets; log paths are also read from the nginx/Apache configs |
 | 7 | Error logs, syslog and application logs: memory exhaustion (`in Unknown on line 0`, clusters), worker crashes, segfaults |
@@ -53,6 +54,16 @@ The script prints this scope and what it detected on the host at the start of ev
 `--since DATE` (`YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `DD.MM.YYYY`; host local time; default `2026-10-17`),
 `--webroot PATH`, `--access-log GLOB`, `--error-log GLOB`, `--skip-files`, `--skip-logs`, `--skip-procs`
 (also skips step 5), `--max-files N`, `--burst N`, `--sample N`, `--json FILE`, `--quiet`, `--no-color`, `--version`.
+
+## CVE-2026-115560
+
+PHP describes an unlikely RCE path that needs all three of: `session.serialize_handler` = `php_binary` or
+`php_serialize` in the configuration, application code that switches it to `php` with `ini_set()` before
+`session_start()`, and session upload progress still enabled. There is no fixed release yet; the mitigation is
+`session.upload_progress.enabled=0` in php.ini or the FPM pool (the same setting already recommended for
+CVE-2026-109619). The script reads the configuration (step 2), searches the code (step 4) and reports one
+combined verdict. A text search cannot see code outside the web roots, generated or obfuscated code, or values
+built at runtime, and mapping a configuration to an application is approximate.
 
 ## Limits worth knowing
 

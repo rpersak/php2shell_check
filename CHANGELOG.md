@@ -2,6 +2,15 @@
 
 All notable changes to `php2shell_check.py`. The format follows [Keep a Changelog](https://keepachangelog.com/); versions follow semantic versioning, where the command-line options and the report format are the public interface.
 
+## [2.4.0] - 2026-10-23
+
+### Added
+- CVE-2026-115560 (PHP informational advisory of 2026-10-23, no fixed release yet). The issue needs all of: `session.serialize_handler` set to `php_binary` or `php_serialize` in the configuration, application code switching it to `php` with `ini_set()` before `session_start()`, and `session.upload_progress.enabled` still on.
+  - Step 1 states that no fixed PHP release exists yet, so the version cannot clear this CVE (`FIXED_115560` is ready to be filled in when PHP publishes the fix).
+  - Step 2 reads `session.serialize_handler` from php.ini, FPM pools (`php_value` / `php_admin_value`) and Apache config, per pool together with the upload progress setting.
+  - Step 4 searches every PHP file in the web roots (any date) for `ini_set('session.serialize_handler', ...)`, notes whether `session_start()` follows in the same file, and reads `session.serialize_handler` from every `.htaccess` / `.user.ini`.
+  - Combined verdict: all three preconditions HIGH; runtime switch to `php` with upload progress on but no risky configuration found MEDIUM; runtime change to another or non-literal value LOW; mitigated by upload progress off INFO.
+
 ## [2.3.1] - 2026-10-22
 
 ### Fixed

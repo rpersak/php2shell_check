@@ -2,11 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 php2shell_check.py - all-in-one LOCAL checker for PHP2Shell
-(CVE-2026-109618 / CVE-2026-109619).
+(CVE-2026-109618 / CVE-2026-109619) and the related session upload progress
+issue CVE-2026-115560 (PHP informational advisory of 2026-10-23).
 
-Version 2.3.1 (2026-10-22)
+Version 2.4.0 (2026-10-23)
 
 Changelog
+  2.4.0  2026-10-23  CVE-2026-115560: session.serialize_handler is read from php.ini, FPM pools, Apache,
+                     .htaccess and .user.ini; every PHP file in the web roots is searched for
+                     ini_set('session.serialize_handler', ...); a combined verdict (config + code + upload
+                     progress) is reported in step 4; step 1 notes that no fixed release exists yet.
   2.3.1  2026-10-22  Header changelog: corrected the release date of 1.0.0.
   2.3.0  2026-10-22  Ideas from php2shell-triage.sh (Laravel/Forge) plus gaps found while comparing: framework
                      aware scan (PHP where Laravel/Symfony/Drupal/WordPress never keep PHP, any date), git
@@ -97,8 +102,8 @@ from collections import Counter, defaultdict
 FIXED = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27), (8, 3): (8, 3, 36), (8, 2): (8, 2, 35)}
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVE_RE = re.compile(r"CVE-2026-10961[89]")
-__version__ = "2.3.1"
-VERSION_DATE = "2026-10-22"
+__version__ = "2.4.0"
+VERSION_DATE = "2026-10-23"
 DEFAULT_SINCE = "2026-10-17"  # earliest publicly reported exploitation attempt
 
 SEV_RANK = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -113,6 +118,21 @@ RECON = {"whoami", "id", "hostname", "uname", "nc", "ncat", "netcat", "socat", "
          "wget", "curl", "xxd", "base64", "openssl", "python", "python3", "perl", "ruby", "busybox"}
 RECON_IN_CMD = re.compile(r"(^|[\s;|&/])(whoami|id|hostname|uname|nc|ncat|netcat|socat|xxd|base64|"
                           r"openssl|curl|wget|/dev/tcp|chmod \+x)(\s|;|$)")
+
+# CVE-2026-115560 (PHP informational advisory 2026-10-23): an RCE path needs ALL of
+#   1. session.serialize_handler = php_binary or php_serialize in the configuration,
+#   2. application code switching it to 'php' with ini_set() before session_start(),
+#   3. session.upload_progress.enabled still on.
+# No fixed release exists yet; PHP will fix it in the next regular release. Fill in the fixed versions here
+# (same layout as FIXED) once PHP publishes the full advisory.
+FIXED_115560 = {}
+RISKY_HANDLERS = ("php_binary", "php_serialize")
+SH_SET_PHP_RE = re.compile(rb"ini_set\s*\(\s*['\"]session\.serialize_handler['\"]\s*,\s*['\"]php['\"]\s*\)", re.I)
+SH_SET_ANY_RE = re.compile(rb"ini_set\s*\(\s*['\"]session\.serialize_handler['\"]\s*,", re.I)
+SH_CFG_RE = re.compile(rb"session\.serialize_handler['\"]?\s*[=\s]\s*['\"]?(php_binary|php_serialize|php)\b", re.I)
+SESSION_START_RE = re.compile(rb"\bsession_start\s*\(")
+# filled by step 2, used by the combined CVE-2026-115560 verdict in step 4
+SERIAL_STATE = {"config": [], "upload_on": [], "upload_off": [], "found_config": False}
 
 APP_ROOTS = []  # filled by step 4, reused by step 7 to find application logs
 STD_PORTS = {20, 21, 22, 25, 53, 80, 110, 123, 143, 389, 443, 465, 587, 636, 853, 993, 995, 1194, 3306, 5432,
@@ -531,6 +551,18 @@ def check_php(rep):
         say("No PHP found on this host.")
     say("Note: containers and other hosts are NOT inspected by this step (check the image tag or run the "
         "script inside the container).")
+    if FIXED_115560:
+        say("CVE-2026-115560: fixed releases are known (%s); compare the versions above" %
+            " / ".join(fmt(x) for x in FIXED_115560.values()))
+    else:
+        say("CVE-2026-115560 (PHP advisory of 23 Oct 2026): no fixed PHP release exists yet, so the version alone "
+            "cannot clear it. Whether the vulnerable combination exists is checked in step 2 (configuration) and "
+            "step 4 (application code).")
+    rep.add("INFO", sec, "CVE-2026-115560: %s. Mitigation until then: session.upload_progress.enabled=0 in php.ini "
+            "or the FPM pool (not via ini_set or .user.ini)." %
+            ("fixed in " + " / ".join(fmt(x) for x in FIXED_115560.values()) if FIXED_115560 else
+             "no fixed PHP release yet (PHP fixes it in the next regular release); exposure depends on configuration "
+             "and application code, see steps 2 and 4"))
     rep.add("INFO", sec, "Containers and other hosts are NOT inspected here. Run the check inside each "
             "container image or check the image tag (fixed: %s)." % " / ".join(fmt(x) for x in FIXED.values()))
     return state
@@ -539,7 +571,7 @@ def check_php(rep):
 # --------------------------------------------------------------------------
 # 2. configuration
 # --------------------------------------------------------------------------
-INI_KEYS = ("session.upload_progress.enabled", "memory_limit", "post_max_size", "upload_max_filesize",
+INI_KEYS = ("session.upload_progress.enabled", "session.serialize_handler", "memory_limit", "post_max_size", "upload_max_filesize",
             "fatal_error_backtraces", "max_input_nesting_level")
 INI_RE = re.compile(r"^\s*(%s)\s*=\s*\"?([^\";\s]+)\"?" % "|".join(re.escape(k) for k in INI_KEYS))
 POOL_DIRECTIVE_RE = re.compile(r"^\s*(php_admin_value|php_value|php_admin_flag|php_flag)\[([^\]]+)\]\s*=\s*(\S+)")
@@ -653,10 +685,19 @@ def check_config(rep, vulnerable, state):
             say("Checking each FPM pool for overrides (php_admin_value = enforced, php_value = app can "
                 "override) and pm.max_requests ...", 2)
         on_pools, mem_not_admin, php_value_mem, no_maxreq = [], [], [], []
+        SERIAL_STATE["found_config"] = True
+        sh_global = str(eff.get("session.serialize_handler", ("php",))[0]).lower()
+        say("session.serialize_handler in ini = %s  (CVE-2026-115560 needs php_binary or php_serialize here plus "
+            "a runtime switch to 'php' in the code)" % (sh_global if "session.serialize_handler" in eff
+                                                        else "php (PHP default)"), 2)
+        sh_risky = []
         for (pname, pfile), info in pools.items():
             pool_up = None
+            pool_sh = None
             mem_admin = False
             for kind, key, val in info["overrides"]:
+                if key == "session.serialize_handler":
+                    pool_sh = val.strip('"').lower()
                 if key == "session.upload_progress.enabled":
                     pool_up = (kind, val)
                 if key == "memory_limit":
@@ -672,12 +713,34 @@ def check_config(rep, vulnerable, state):
                                "prefer php_admin_value)" % (pname, pool_up[0]))
             if eff_up:
                 on_pools.append(pname)
+            where = "%s pool [%s]" % (label, pname)
+            (SERIAL_STATE["upload_on"] if eff_up else SERIAL_STATE["upload_off"]).append(where)
+            if (pool_sh or sh_global) in RISKY_HANDLERS:
+                sh_risky.append((where, pool_sh or sh_global, eff_up))
             if not mem_admin:
                 mem_not_admin.append(pname)
             if not info["max_requests"] or info["max_requests"] > 1:
                 no_maxreq.append(pname)
             say("pool [%s]: upload_progress %s, memory_limit=-1 enforced: %s, pm.max_requests=%s" %
                 (pname, "ON" if eff_up else "off", "yes" if mem_admin else "no", info["max_requests"]), 3)
+        if not pools:
+            (SERIAL_STATE["upload_on"] if up_on else SERIAL_STATE["upload_off"]).append(label)
+            if sh_global in RISKY_HANDLERS:
+                sh_risky.append((label, sh_global, up_on))
+        for where, handler, upl in sh_risky:
+            SERIAL_STATE["config"].append({"where": where, "handler": handler, "upload": upl})
+            say("%s: session.serialize_handler=%s with upload_progress %s -> CVE-2026-115560 configuration "
+                "precondition %s" % (where, handler, "ON" if upl else "off",
+                                     "PRESENT (code is checked in step 4)" if upl else "present but mitigated"), 3)
+        if sh_risky:
+            on = [w for w, h, u in sh_risky if u]
+            if on:
+                rep.add("LOW", sec, "%s: session.serialize_handler is php_binary/php_serialize with upload progress ON "
+                        "(1 of 3 CVE-2026-115560 preconditions; step 4 checks the application code for the runtime "
+                        "switch)" % label, ["%s: %s" % (w, h) for w, h, u in sh_risky if u])
+            else:
+                rep.add("INFO", sec, "%s: session.serialize_handler is php_binary/php_serialize, but upload progress "
+                        "is off, so CVE-2026-115560 is mitigated" % label, ["%s: %s" % (w, h) for w, h, u in sh_risky])
         if pools:
             det.append("FPM pools: %d (%s)" % (len(pools), ", ".join(sorted({p[0] for p in pools})[:8])))
         if "apache2" in label:
@@ -711,13 +774,18 @@ def check_config(rep, vulnerable, state):
                         "these only reduce exposure, updating is the only complete fix" % label, extra)
 
     say("Scanning Apache configs (/etc/apache2, /etc/httpd) for php_admin_value/php_value overrides of "
-        "memory_limit or upload_progress ...")
+        "memory_limit, upload_progress or serialize_handler ...")
     hits = []
     for pat in ("/etc/apache2/**/*.conf", "/etc/httpd/**/*.conf"):
         for f in glob.glob(pat, recursive=True):
             for ln, line in enumerate(read_text(f).splitlines(), 1):
-                if re.search(r"^\s*php_(admin_)?(value|flag)\s+(memory_limit|session\.upload_progress)", line):
+                if re.search(r"^\s*php_(admin_)?(value|flag)\s+(memory_limit|session\.upload_progress|"
+                             r"session\.serialize_handler)", line):
                     hits.append("%s:%d: %s" % (f, ln, trunc(line.strip())))
+                    m = SH_CFG_RE.search(line.encode("utf-8", "replace"))
+                    if m and m.group(1).decode().lower() in RISKY_HANDLERS:
+                        SERIAL_STATE["config"].append({"where": "%s:%d" % (f, ln), "handler": m.group(1).decode().lower(),
+                                                       "upload": None})
     say("found %d matching Apache directive(s)" % len(hits), 2)
     if hits:
         rep.add("INFO", sec, "Apache config sets mitigation-related PHP values", hits)
@@ -997,6 +1065,56 @@ def git_dirty(path):
     return keep, []
 
 
+def assess_115560(rep, sec, sh_code, sh_dir, php_files, limit_hit):
+    """Combine configuration (step 2), per-directory files and code (step 4) into one CVE-2026-115560 verdict."""
+    say("CVE-2026-115560 verdict: combining the configuration from step 2 with what was found in the code ...")
+    cfg = [c for c in SERIAL_STATE["config"]]
+    cfg += [{"where": p, "handler": h, "upload": None} for p, h in sh_dir if h in RISKY_HANDLERS]
+    up_on, up_off = SERIAL_STATE["upload_on"], SERIAL_STATE["upload_off"]
+    if not SERIAL_STATE["found_config"]:
+        upload = "unknown (no php.ini/pool found; PHP default is ON)"
+        upload_on = True
+    elif up_on:
+        upload = "ON in %d place(s)" % len(up_on)
+        upload_on = True
+    else:
+        upload = "off everywhere it was checked"
+        upload_on = False
+    to_php, other = sh_code.get("php", []), sh_code.get("other", [])
+    say("1) risky serialize_handler in configuration: %d place(s); 2) runtime switch to 'php' in code: %d file(s) "
+        "(+%d other runtime changes); 3) upload progress: %s" % (len(cfg), len(to_php), len(other), upload), 2)
+    detail = ["config: %s = %s" % (c["where"], c["handler"]) for c in cfg]
+    detail += ["code: " + x for x in to_php] + ["code (other value): " + x for x in other]
+    if up_on:
+        detail.append("upload progress ON in: " + ", ".join(up_on[:8]))
+    caveat = ("Mapping a config to an application is approximate: check that the flagged code runs under the "
+              "flagged configuration and that ini_set() is executed before session_start().")
+    if to_php and not upload_on:
+        rep.add("INFO", sec, "CVE-2026-115560: code switches session.serialize_handler to 'php' at runtime, but upload "
+                "progress is off - mitigated (keep it off)", detail)
+    elif to_php and cfg:
+        rep.add("HIGH", sec, "CVE-2026-115560: ALL three preconditions appear on this host (risky serialize_handler in "
+                "config, runtime switch to 'php' in code, upload progress on). Set session.upload_progress.enabled=0 "
+                "in php.ini/the FPM pool now and restart PHP. " + caveat, detail)
+    elif to_php:
+        rep.add("MEDIUM", sec, "CVE-2026-115560: code switches session.serialize_handler to 'php' at runtime and upload "
+                "progress is on. No php_binary/php_serialize was found in the configuration that was read, but the "
+                "application may set it elsewhere (vhost, pool or panel config not scanned). Safest: "
+                "session.upload_progress.enabled=0", detail)
+    elif other:
+        rep.add("LOW", sec, "CVE-2026-115560: code changes session.serialize_handler at runtime to a non-literal or other "
+                "value; review whether it can become 'php'", detail)
+    elif cfg and upload_on:
+        rep.add("INFO", sec, "CVE-2026-115560: risky serialize_handler in config with upload progress on, but no "
+                "runtime switch to 'php' in %d PHP file(s) scanned - the code precondition is not present in the "
+                "scanned code" % php_files, detail)
+    else:
+        rep.add("INFO", sec, "CVE-2026-115560: vulnerable combination not found (%d PHP file(s) searched%s)" %
+                (php_files, "; file limit reached, coverage incomplete" if limit_hit else ""))
+    say("note: code outside the web roots, generated/obfuscated code and values built at runtime cannot be seen by "
+        "a text search", 2)
+
+
 def check_files(rep, args, since_ts, web_users):
     sec = "4. Files"
     say("Discovering web roots: common paths (/var/www, /srv, /home/*/public_html, ...) plus 'root' and "
@@ -1029,7 +1147,12 @@ def check_files(rep, args, since_ts, web_users):
     say("images (jpg/png/gif/...) that actually contain '<?php'", 2)
     say("recently changed executable files and any PHP file inside an uploads/cache/tmp/media-like folder", 2)
     say("PHP files in framework directories that never hold PHP (checked regardless of date)", 2)
+    say("EVERY PHP file (any date) is also searched for ini_set('session.serialize_handler', ...), and every "
+        ".htaccess/.user.ini for session.serialize_handler - the code and per-directory preconditions of "
+        "CVE-2026-115560", 2)
     finds = defaultdict(list)
+    sh_code, sh_dir = defaultdict(list), []
+    php_files = 0
     scanned = 0
     recent_code = 0
     limit_hit = False
@@ -1063,11 +1186,20 @@ def check_files(rep, args, since_ts, web_users):
                 stamp = fts(max(st.st_mtime, st.st_ctime))
 
                 if ext in PHPEXT:
+                    php_files += 1
                     if recent:
                         recent_code += 1
                     zone = bool(fw) and in_no_php_zone(fw, rel)
+                    data = read_bytes(path, 2000000)
+                    if b"serialize_handler" in data:
+                        m = SH_SET_PHP_RE.search(data) or SH_SET_ANY_RE.search(data)
+                        if m:
+                            ln_no = data[:m.start()].count(b"\n") + 1
+                            ss = SESSION_START_RE.search(data, m.end())
+                            kind = "php" if SH_SET_PHP_RE.match(data, m.start()) else "other"
+                            sh_code[kind].append("%s:%d%s" % (path, ln_no, " (session_start() follows in the same file)"
+                                                              if ss else ""))
                     if recent or in_upload or zone:
-                        data = read_bytes(path, 2000000)
                         hits = scan_content(data, WEBSHELL_PATTERNS)
                         for sev, label in hits:
                             finds[sev].append("%s [%s] %s" % (path, stamp, label))
@@ -1079,8 +1211,11 @@ def check_files(rep, args, since_ts, web_users):
                         elif not hits and recent:
                             finds["LOW"].append("%s [%s] recently changed code file" % (path, stamp))
                 elif fn in (".htaccess", ".user.ini"):
+                    data = read_bytes(path, 200000)
+                    m = SH_CFG_RE.search(data)
+                    if m:
+                        sh_dir.append((path, m.group(1).decode().lower()))
                     if recent:
-                        data = read_bytes(path, 200000)
                         for sev, label in scan_content(data, HTACCESS_PATTERNS):
                             finds[sev].append("%s [%s] %s" % (path, stamp, label))
                 elif ext in IMGEXT and recent:
@@ -1114,6 +1249,7 @@ def check_files(rep, args, since_ts, web_users):
     rep.add("INFO", sec, "Scanned %d files in %d project/web root(s): %s; %d code files changed since the cutoff" %
             (scanned, len(scan_roots), ", ".join(scan_roots[:6]) + (" ..." if len(scan_roots) > 6 else ""),
              recent_code))
+    assess_115560(rep, sec, sh_code, sh_dir, php_files, limit_hit)
 
     if shutil.which("git"):
         say("Checking git checkouts: 'git status' (read-only, no index refresh) shows tracked files modified and "
@@ -1982,11 +2118,14 @@ STEP_TEXT = {
     2: ("PHP configuration (interim mitigations)",
         "Reads php.ini, conf.d and every PHP-FPM pool to see session.upload_progress.enabled, memory_limit, "
         "post_max_size, fatal_error_backtraces and pm.max_requests, and whether values are enforced "
-        "(php_admin_value) or overridable (php_value).",
+        "(php_admin_value) or overridable (php_value). Also reads session.serialize_handler (php.ini, pools, "
+        "Apache) for CVE-2026-115560.",
         "The PHP advisory lists these settings as stop-gaps that reduce exposure to specific attack paths "
-        "while you cannot update. upload_progress should stay off even after patching.",
+        "while you cannot update. upload_progress should stay off even after patching; it is also the only "
+        "mitigation for CVE-2026-115560, which has no fixed release yet.",
         "upload_progress is on; memory_limit=-1 is not enforced per pool; pm.max_requests is not 1 "
-        "(MEDIUM when PHP is vulnerable, otherwise low/info)."),
+        "(MEDIUM when PHP is vulnerable, otherwise low/info); serialize_handler php_binary/php_serialize with "
+        "upload progress on (LOW, the code is checked in step 4)."),
     3: ("Running processes and network connections",
         "Reads /proc: finds PHP workers still running a replaced binary, shells/recon tools started below a "
         "web or PHP process, and established TCP connections: those owned by a child of a web process, by the "
@@ -2001,14 +2140,17 @@ STEP_TEXT = {
         "Finds web roots (and the framework project root above them), scans files changed since the cutoff "
         "and everything in upload/cache-like folders for webshell code, hidden PHP in images and malicious "
         ".htaccess/.user.ini; flags PHP in directories where Laravel/Symfony/Drupal/WordPress never keep PHP "
-        "at ANY date; compares git checkouts with the committed code; then inspects /tmp, /var/tmp and "
-        "/dev/shm for dropped tools.",
+        "at ANY date; compares git checkouts with the committed code; searches EVERY PHP file for a runtime "
+        "switch of session.serialize_handler (CVE-2026-115560) and combines it with the configuration from "
+        "step 2; then inspects /tmp, /var/tmp and /dev/shm for dropped tools.",
         "Updating PHP does not remove a webshell that was planted earlier. File evidence is stronger proof of "
         "compromise than any log line, and a git diff is the cleanest truth for deployed code.",
         "eval(base64_decode()), system($_POST[]) and similar (HIGH); PHP inside images (HIGH); "
         "auto_prepend_file (HIGH); PHP in upload or no-PHP framework folders, files with a future "
         "modification time, git differences in PHP/public files, new executables (MEDIUM); ELF files owned "
-        "by the web user in /tmp (HIGH). Long lists of changed files after a deployment are summarised."),
+        "by the web user in /tmp (HIGH). Long lists of changed files after a deployment are summarised. "
+        "CVE-2026-115560: all three preconditions (HIGH), runtime switch to 'php' with upload progress on but "
+        "no risky config found (MEDIUM), other runtime changes (LOW), mitigated (INFO)."),
     5: ("Persistence and system changes",
         "Checks crontabs, SSH keys and login shells of web accounts, /etc/ld.so.preload, extra UID 0 accounts, "
         "shell history files (bash/zsh) of all accounts, successful SSH logins since the cutoff (grouped by "
@@ -2044,7 +2186,8 @@ STEP_TEXT = {
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Local read-only checker for PHP2Shell (CVE-2026-109618 / CVE-2026-109619)")
+    ap = argparse.ArgumentParser(description="Local read-only checker for PHP2Shell (CVE-2026-109618 / CVE-2026-109619) "
+                                             "and CVE-2026-115560")
     ap.add_argument("--since", default=DEFAULT_SINCE,
                     help="start of the period: YYYY-MM-DD, 'YYYY-MM-DD HH:MM' or DD.MM.YYYY, in the host's local time "
                          "(default %s, the earliest reported attempt)" % DEFAULT_SINCE)
@@ -2081,7 +2224,8 @@ def main():
     rep = Report(sys.stdout.isatty() and not args.no_color)
     total = len(STEP_TEXT)
 
-    print("php2shell_check v%s (%s) - CVE-2026-109618 / CVE-2026-109619  (read-only, nothing is changed or sent)" %
+    print("php2shell_check v%s (%s) - CVE-2026-109618 / CVE-2026-109619 / CVE-2026-115560  (read-only, nothing is "
+          "changed or sent)" %
           (__version__, VERSION_DATE))
     print("host=%s  user=%s  time=%s  checking from=%s" % (socket.gethostname(), uname(os.geteuid()),
                                                           time.strftime("%Y-%m-%d %H:%M"),
